@@ -140,3 +140,33 @@ A ordem dentro da transação SQL é: inbox (se vier do SQS) → `SELECT ... FOR
 - Custo: um replay também espera o lock da wallet. É aceitável, porque a contenção é por wallet (não há lock global) e o replay é curto.
 
 **Teste:** `test/integration/wallet-lock-order.test.ts`. Um teste de controle reproduz o deadlock de forma determinística com a ordem errada (exige um `40P01`). Os testes de carga disparam 60 apostas distintas e 50 cópias da mesma aposta em paralelo na mesma wallet e falham se **qualquer** transação lançar erro (deadlock incluído). Com a ordem invertida, eles falham listando os `40P01`. Na fatia 4 os testes de carga passam a chamar o use case real.
+
+### 5.2 Decidir sob o lock e inserir a transação já no estado final
+Com a wallet travada, o use case aplica a regra em memória (domínio) e só então faz o `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING`, já com `status`, `failure_code` e `balance_after` definitivos. Se o INSERT não inserir nada, a decisão é descartada (nada foi gravado), a linha existente é carregada e o `payload_hash` decide entre replay e 409. Se inserir, gravam-se o lançamento, o `UPDATE wallets ... WHERE version = ?` e a outbox. Assim BET, WIN e LOSS nunca fazem UPDATE em `wager_transactions`.
+
+### 5.3 `payloadHash`
+SHA-256 (hex) do JSON canônico, com chaves ordenadas recursivamente, dos campos de negócio: `providerId`, `externalTransactionId`, `playerId`, `walletId`, `roundId`, `gameId`, `kind`, `money {amount, currency}` e `referenceExternalTransactionId` (só quando presente). O header `Idempotency-Key`, o `correlationId` e outros metadados de transporte ficam de fora. Todos os valores são strings, e `amount` já passou pela regex estrita do `Money`, então não existe normalização numérica que mude o hash.
+
+### 5.4 Violação de unicidade (23505) mapeada pelo nome da constraint
+Só `wt_provider_external_uq` vira `409 EXTERNAL_TRANSACTION_ID_CONFLICT`: o mesmo `externalTransactionId` do provider chegou com outra `Idempotency-Key`. O caminho de idempotência normal nunca chega aqui, porque o `ON CONFLICT (idempotency_key)` já o absorve. Qualquer outra constraint (PK, ledger e as demais) indica bug e vira `500 INTERNAL_ERROR` com log que cita a constraint. Não uso `ON CONFLICT DO NOTHING` sem alvo, que esconderia essas violações e também o índice anti-dupla-reversão.
+
+### 5.5 Pool e `lock_timeout`
+O pool tem 20 conexões por padrão (`DB_POOL_MAX`). Cada transação de submissão roda `SET LOCAL lock_timeout` com o valor de `DB_LOCK_TIMEOUT_MS` (default 10000). O valor precisa ser alto o bastante para que uma fila normal de requisições na mesma wallet espere, em vez de falhar: o teste de 50 requisições paralelas na mesma wallet exige zero 503 e zero `40P01`. Estourar o timeout (`55P03`) é contenção anormal e vira `503` com `Retry-After`, que o provedor pode reenviar com segurança pela idempotência. Ele existe para que uma requisição não segure uma conexão do pool indefinidamente atrás de um lock preso.
+
+### 5.6 OPENING: valores sintéticos e provider reservado
+A transação interna `OPENING` preenche as colunas NOT NULL com valores sintéticos e determinísticos: `provider_id = 'internal'`, `external_transaction_id = 'opening:{walletId}'`, `idempotency_key = 'internal:opening:{walletId}'` e `payload_hash` = SHA-256 do JSON canônico de `{kind: 'OPENING', walletId, playerId, money}`. `round_id` e `game_id` ficam NULL, como o CHECK `wt_round_game_required` já permite. Em `PROCESSED`, `balance_after` é o próprio saldo inicial.
+
+O provider `internal` é **reservado**. A API e a fila recusam com 400 um `providerId` igual a `internal` (sem diferenciar maiúsculas) e uma `Idempotency-Key` que comece com `internal:`. O domínio também recusa em `WagerTransaction.create`, e a migration 0003 coloca isso no schema: `CHECK ((provider_id = 'internal') = (kind = 'OPENING'))`. Assim, nenhum provedor colide com as chaves da abertura nem forja uma OPENING. A abertura gera só `WalletBalanceChanged` na outbox: ela não é uma transação de provedor.
+
+### 5.7 `PLAYER_MISMATCH`
+Uma transação cujo `playerId` não é o dono da `walletId` é **persistida como REJECTED** com `PLAYER_MISMATCH` (422), e não descartada. Assim fica auditável e idempotente (o reenvio é replay). Ela não altera saldo nem gera ledger. Exigiu a migration 0003, que acrescenta o código ao `CHECK wt_failure_code_valid`; o `down` converte as linhas para `REFERENCE_MISMATCH`, com perda de detalhe, como na 0002. Ordem das checagens sob o lock: player, depois moeda (`CURRENCY_MISMATCH`), depois a regra do tipo.
+
+### 5.8 Saldo observado na moeda da wallet
+`balance_after` é sempre o saldo da wallet e, portanto, está na moeda **da wallet**. Isso só faz diferença em `CURRENCY_MISMATCH`, quando a moeda da transação é outra. O domínio aceita isso em `reject`; `markProcessed` continua exigindo a mesma moeda, porque só se processa quando as moedas batem. O replay lê a moeda do saldo por JOIN com `wallets`, não pela coluna `currency` da transação.
+
+### 5.9 Contrato HTTP da submissão
+- Transação (primeira vez e replay): `{transactionId, status, failureCode, balance, idempotentReplay}`, com `failureCode` `null` quando não há. PROCESSED → 200 e REJECTED → 422, inclusive no replay, que devolve a mesma resposta com `idempotentReplay: true` e o saldo observado na época.
+- Erros: `{code, message}`, com `code` legível por máquina: `INVALID_PAYLOAD` (400, com `details`), `WALLET_NOT_FOUND` (404), `IDEMPOTENCY_KEY_CONFLICT`, `EXTERNAL_TRANSACTION_ID_CONFLICT` e `WALLET_ALREADY_EXISTS` (409), `REFERENCE_NOT_SUPPORTED_YET` (501), `SERVICE_UNAVAILABLE` (503 com `Retry-After`) e `INTERNAL_ERROR` (500).
+- `Idempotency-Key`: obrigatório, de 1 a 255 caracteres ASCII visíveis (`0x21` a `0x7E`), sem o prefixo reservado `internal:`.
+- Validação estrita, escrita à mão (sem dependência nova): campos desconhecidos são recusados, porque não entram no hash e mudariam o significado da requisição sem mudar a idempotência. `amount` só como string no formato do `Money`, então `25`, `"25.5"` e `"1e3"` dão 400. `kind = OPENING` dá 400. `playerId` e `walletId` precisam ser UUID.
+- **Temporário (até a fatia 4b):** qualquer requisição com `referenceExternalTransactionId` (REFUND, ROLLBACK, e WIN ou LOSS com referência) recebe `501 REFERENCE_NOT_SUPPORTED_YET` sem persistir nada.
