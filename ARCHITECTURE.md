@@ -83,3 +83,46 @@ Uma transação para uma `walletId` que não existe **não é persistida**. A FK
 | `CURRENCY_MISMATCH` | REJECTED | moeda da operação diferente da wallet |
 | `INVALID_REFERENCE_KIND` | REJECTED | REFUND sobre algo que não é BET, ou ROLLBACK sobre algo que não é BET, WIN ou REFUND |
 | `INTERNAL_ERROR` | FAILED | erro permanente de infraestrutura, terminal e auditável |
+
+## 4. Domínio (`src/domain`)
+
+Puro: só importa módulos relativos e `decimal.js`. Sem NestJS, MikroORM nem `node:`. Um teste (`purity.test.ts`) varre os imports e também proíbe `parseFloat`, `Number(` e `.toNumber(`. Construtores são `private`, e as instâncias nascem por `create`/`open`/`receive`/`enqueue` (validam) ou `rehydrate` (não valida nada).
+
+### 4.1 Money
+`Decimal` (clone isolado, precisão 40) com escala fixa de 2. `Money.from` aceita só `^(0|[1-9]\d{0,16})\.\d{2}$`: sem sinal, sem notação científica, sem zeros à esquerda, e no máximo 17 dígitos inteiros para caber em `NUMERIC(19,2)`. `subtract` e `negate` podem produzir negativos (para checar saldo), mas esses valores não voltam por `from`. Moedas diferentes lançam `CurrencyMismatchError`. O `toFixed(2)` usado na serialização é o do `Decimal` (exato), não o de `Number`.
+
+### 4.2 Wallet: `debit` e `credit` devolvem o lançamento
+A única porta de mudança de saldo é `apply`, que atualiza saldo, `version` e `updatedAt` e cria o `WalletLedgerEntry` na mesma chamada. Assim "toda alteração de saldo tem um lançamento" vale no código, além do banco. O lançamento carrega `walletVersion` (a versão **depois** do lançamento, coluna `wallet_version` do ledger). `at` e `entryId` entram por parâmetro: o domínio não lê relógio nem gera UUID. Valor zero ou negativo lança `InvalidAmountError`; débito acima do saldo lança `InsufficientFundsError`, sem alterar nada.
+
+`Wallet.open` cria a wallet com saldo **zero** e `version` 1. O saldo inicial entra por `credit` numa transação `OPENING`, o que gera o lançamento e leva a wallet à versão 2 (desvio do esqueleto do enunciado, que passa `initialBalance`; é a forma de manter a invariante do ledger).
+
+O domínio não impede concorrência: quem chama deve ter travado a linha da wallet (`FOR UPDATE`) antes de ler o estado (seção 2.4).
+
+### 4.3 WagerTransaction: estados e transições
+```
+PENDING           -> PENDING_REFERENCE | PROCESSED | REJECTED | FAILED
+PENDING_REFERENCE -> PROCESSED | REJECTED | FAILED
+PROCESSED, REJECTED, FAILED: terminais (qualquer transição lança InvalidTransactionStateError)
+```
+- `create` rejeita `OPENING`; o crédito de abertura nasce em `WagerTransaction.opening` (provider `internal`, sem rodada/jogo, chave `internal:opening:{walletId}`).
+- `markProcessed` e `reject` recebem o saldo observado (`balanceAfter`), que o schema exige em PROCESSED e REJECTED. `fail` não recebe saldo e sempre grava `INTERNAL_ERROR`.
+- `markProcessed` de uma reversão exige o `referenceTransactionId` já resolvido (espelha `wt_processed_reversal_resolved`).
+- PENDING_REFERENCE -> PENDING_REFERENCE não é transição. Um novo retry é `registerReferenceRetry(nextAttemptAt)`, que só conta a tentativa (`attempts`) e reagenda. Só REFUND e ROLLBACK entram em `PENDING_REFERENCE`.
+
+### 4.4 `validateReference` (regras de referência no domínio)
+Devolve `resolved`, `wait` ou `reject` com o `failureCode`. Ordem das checagens, da mais para a menos específica da identidade:
+1. referência ausente: `wait`;
+2. provider, player, wallet ou rodada diferentes: `REFERENCE_MISMATCH`;
+3. tipo inválido (REFUND só sobre BET; ROLLBACK sobre BET, WIN ou REFUND): `INVALID_REFERENCE_KIND`;
+4. moeda diferente: `CURRENCY_MISMATCH`; valor diferente: `AMOUNT_MISMATCH`;
+5. status da referência: `PROCESSED` resolve; `PENDING` e `PENDING_REFERENCE` são tratadas como **ausentes** (`wait`: a dependente continua em `PENDING_REFERENCE`); `REJECTED` e `FAILED` dão `REFERENCE_NOT_PROCESSED`, porque não há efeito a reverter e esperar não adiantaria.
+
+`ALREADY_REVERSED` **não** é decidido aqui: depende de outras linhas do banco e é checado pelo use case sob o lock da wallet (seção 2.4). A identidade é conferida antes do status de propósito: uma referência de outro player deve ser reportada como `REFERENCE_MISMATCH` mesmo que esteja REJECTED.
+
+`ledgerDirectionFor(reference)`: BET debita; OPENING, WIN e REFUND creditam; ROLLBACK é o inverso da direção da referência; LOSS não tem lançamento. `failureCodeForOverdraw()`: BET sem saldo é `INSUFFICIENT_FUNDS`; reversão que estoura o saldo é `REVERSAL_WOULD_OVERDRAW`.
+
+### 4.5 Eventos
+`aggregateId` é sempre o `walletId`, a unidade de concorrência e de ordenação (mesmo valor do `MessageGroupId`); o `transactionId` vai em `data`. `data` só tem JSON (`MoneyProps`, datas em ISO), e `from(...)` exige o estado certo da transação (por exemplo, `WagerTransactionProcessed.from` só aceita PROCESSED). `WalletBalanceChanged` é um por lançamento.
+
+### 4.6 Outbox, inbox e backoff
+`OutboxMessage.enqueue` usa o `eventId` como `id` (deduplication id no SQS) e `occurredAt` como primeiro `nextAttemptAt` (não opcional, como no schema). `scheduleRetry` incrementa `attempts` e agenda `now + min(1s · 2^(attempts-1), 5min)`. O backoff não tem jitter no domínio, para ser determinístico; jitter, se for preciso, fica na infraestrutura.
