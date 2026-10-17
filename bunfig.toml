@@ -1,0 +1,3 @@
+[test]
+# Testes de integração contra containers reais precisam de mais folga que o padrão de 5s.
+timeout = 30000
