@@ -16,6 +16,40 @@ describe('Wallet.open', () => {
   });
 });
 
+describe('Wallet.openWithBalance', () => {
+  const open = (initialBalance: Money) =>
+    Wallet.openWithBalance({ id: 'w', playerId: 'p', at: NOW, initialBalance, transactionId: 'opening-tx', entryId: 'e1' });
+
+  test('starts at the initial balance and version 1, with the OPENING credit at walletVersion 1', () => {
+    const { wallet, openingEntry } = open(brl('100.00'));
+    expect(wallet.balance.toJSON()).toEqual({ amount: '100.00', currency: 'BRL' });
+    expect(wallet.version).toBe(1);
+    expect(wallet.currency).toBe('BRL');
+    expect(openingEntry.walletVersion).toBe(1);
+    expect(openingEntry.direction).toBe(LedgerDirection.Credit);
+    expect(openingEntry.transactionId).toBe('opening-tx');
+    expect(openingEntry.balanceBefore.toJSON().amount).toBe('0.00');
+    expect(openingEntry.balanceAfter.equals(wallet.balance)).toBe(true);
+  });
+
+  test('the next movement takes version 2', () => {
+    const { wallet } = open(brl('100.00'));
+    const entry = wallet.debit(move('80.00'));
+    expect(wallet.version).toBe(2);
+    expect(entry.walletVersion).toBe(2);
+  });
+
+  test('takes the currency from the initial balance', () => {
+    const { wallet } = open(Money.from({ amount: '5.00', currency: 'USD' }));
+    expect(wallet.currency).toBe('USD');
+  });
+
+  test('rejects a zero or negative initial balance (zero uses open, without an entry)', () => {
+    expect(() => open(brl('0.00'))).toThrow(InvalidAmountError);
+    expect(() => open(brl('1.00').negate())).toThrow(InvalidAmountError);
+  });
+});
+
 describe('Wallet.credit and debit', () => {
   test('credit adds to the balance, bumps the version and returns the matching ledger entry', () => {
     const wallet = walletWith('0.00');
@@ -93,13 +127,15 @@ describe('Wallet.credit and debit', () => {
     const usd = { ...move('1.00'), money: Money.from({ amount: '1.00', currency: 'USD' }) };
     expect(() => wallet.credit(usd)).toThrow(CurrencyMismatchError);
     expect(() => wallet.debit(usd)).toThrow(CurrencyMismatchError);
-    expect(wallet.version).toBe(2);
+    expect(wallet.version).toBe(1);
   });
 
   test('the balance always equals the sum of the returned ledger entries', () => {
-    const wallet = Wallet.open({ id: 'w', playerId: 'p', currency: 'BRL', at: NOW });
+    const { wallet, openingEntry } = Wallet.openWithBalance({
+      id: 'w', playerId: 'p', at: NOW, initialBalance: brl('100.00'), transactionId: nextId(), entryId: nextId(),
+    });
     const entries = [
-      wallet.credit(move('100.00')),
+      openingEntry,
       wallet.debit(move('30.50')),
       wallet.credit(move('0.75')),
       wallet.debit(move('70.25')),
@@ -109,7 +145,8 @@ describe('Wallet.credit and debit', () => {
       Money.zero('BRL'),
     );
     expect(wallet.balance.equals(sum)).toBe(true);
-    expect(entries.map((e) => e.walletVersion)).toEqual([2, 3, 4, 5]);
+    expect(entries.map((e) => e.walletVersion)).toEqual([1, 2, 3, 4]);
+    expect(wallet.version).toBe(4);
   });
 });
 

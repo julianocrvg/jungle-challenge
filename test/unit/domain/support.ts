@@ -15,12 +15,13 @@ export const brl = (amount: string) => Money.from({ amount, currency: 'BRL' });
 let sequence = 0;
 export const nextId = () => `id-${++sequence}`;
 
+/** Wallet na version 1: aberta com saldo zero, ou já com o saldo inicial (lançamento OPENING em v1). */
 export function walletWith(balance: string, currency = 'BRL'): Wallet {
-  const wallet = Wallet.open({ id: 'wallet-1', playerId: 'player-1', currency, at: NOW });
-  if (balance !== '0.00') {
-    wallet.credit({ money: Money.from({ amount: balance, currency }), transactionId: nextId(), entryId: nextId(), at: NOW });
-  }
-  return wallet;
+  const base = { id: 'wallet-1', playerId: 'player-1', at: NOW };
+  if (balance === '0.00') return Wallet.open({ ...base, currency });
+  return Wallet.openWithBalance({
+    ...base, initialBalance: Money.from({ amount: balance, currency }), transactionId: nextId(), entryId: nextId(),
+  }).wallet;
 }
 
 export function txProps(overrides: Partial<CreateWagerTransactionProps> = {}): CreateWagerTransactionProps {

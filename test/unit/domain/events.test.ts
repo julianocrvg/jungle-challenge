@@ -34,7 +34,7 @@ describe('WalletBalanceChanged', () => {
         money: { amount: '80.00', currency: 'BRL' },
         balanceBefore: { amount: '100.00', currency: 'BRL' },
         balanceAfter: { amount: '20.00', currency: 'BRL' },
-        walletVersion: 3,
+        walletVersion: 2,
       },
     });
   });

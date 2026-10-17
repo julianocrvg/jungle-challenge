@@ -52,7 +52,7 @@ Usei `TEXT + CHECK` em vez de `CREATE TYPE`. Acrescentar um valor vira só troca
 
 ### 2.5 `wallet_ledger_entries`
 - `UNIQUE (wallet_id, transaction_id)`: no máximo um lançamento por transação.
-- `wallet_version` guarda a versão da wallet **depois** do lançamento, com `UNIQUE (wallet_id, wallet_version)`. Como `version` só incrementa quando o saldo muda, cada versão corresponde a exatamente um lançamento, e um lost update aparece como violação de unicidade. Essa coluna é também a chave do cursor de paginação do ledger: estável, monotônica por wallet e sem empate (melhor que `created_at`). Uma wallet aberta com saldo zero fica na versão 1 sem lançamento; o primeiro crédito gera a versão 2.
+- `wallet_version` guarda a versão da wallet **depois** do lançamento, com `UNIQUE (wallet_id, wallet_version)`. Como `version` só incrementa quando o saldo muda, cada versão corresponde a exatamente um lançamento, e um lost update aparece como violação de unicidade. Essa coluna é também a chave do cursor de paginação do ledger: estável, monotônica por wallet e sem empate (melhor que `created_at`). Uma wallet aberta com saldo zero fica na versão 1 sem lançamento. Aberta com saldo inicial, fica na versão 1 **com** o lançamento OPENING em `wallet_version = 1` (seção 4.2). Nos dois casos, o movimento seguinte gera a versão 2, e vale `version = COALESCE(MAX(wallet_version), 1)`.
 - `ledger_arithmetic`: `balance_after = balance_before ± amount`, conforme `direction`. O banco recusa um lançamento que não fecha.
 - FK `(wallet_id, currency) → wallets (id, currency)`: o lançamento tem a moeda da wallet.
 - FK `(transaction_id, wallet_id) → wager_transactions (id, wallet_id)`: lançamento e transação apontam para a mesma wallet.
@@ -94,7 +94,7 @@ Puro: só importa módulos relativos e `decimal.js`. Sem NestJS, MikroORM nem `n
 ### 4.2 Wallet: `debit` e `credit` devolvem o lançamento
 A única porta de mudança de saldo é `apply`, que atualiza saldo, `version` e `updatedAt` e cria o `WalletLedgerEntry` na mesma chamada. Assim "toda alteração de saldo tem um lançamento" vale no código, além do banco. O lançamento carrega `walletVersion` (a versão **depois** do lançamento, coluna `wallet_version` do ledger). `at` e `entryId` entram por parâmetro: o domínio não lê relógio nem gera UUID. Valor zero ou negativo lança `InvalidAmountError`; débito acima do saldo lança `InsufficientFundsError`, sem alterar nada.
 
-`Wallet.open` cria a wallet com saldo **zero** e `version` 1. O saldo inicial entra por `credit` numa transação `OPENING`, o que gera o lançamento e leva a wallet à versão 2 (desvio do esqueleto do enunciado, que passa `initialBalance`; é a forma de manter a invariante do ledger).
+`Wallet.open` cria a wallet com saldo **zero** e `version` 1, sem lançamento. `Wallet.openWithBalance` cria a wallet **já com o saldo inicial** e `version` 1, e devolve junto o lançamento OPENING (CREDIT de `0.00` até o saldo, `walletVersion` 1), que vai para a transação `OPENING`. Assim `POST /wallets` responde `version: 1` com ou sem saldo inicial, como no esqueleto do enunciado, e a invariante "todo saldo tem lançamento" continua valendo. (Antes, o saldo inicial entrava por `credit` e a wallet nascia na versão 2; isso foi trocado porque expor `version: 2` numa wallet recém-criada é surpreendente para o cliente.)
 
 O domínio não impede concorrência: quem chama deve ter travado a linha da wallet (`FOR UPDATE`) antes de ler o estado (seção 2.4).
 
@@ -126,3 +126,17 @@ Devolve `resolved`, `wait` ou `reject` com o `failureCode`. Ordem das checagens,
 
 ### 4.6 Outbox, inbox e backoff
 `OutboxMessage.enqueue` usa o `eventId` como `id` (deduplication id no SQS) e `occurredAt` como primeiro `nextAttemptAt` (não opcional, como no schema). `scheduleRetry` incrementa `attempts` e agenda `now + min(1s · 2^(attempts-1), 5min)`. O backoff não tem jitter no domínio, para ser determinístico; jitter, se for preciso, fica na infraestrutura.
+
+## 5. Use case de submissão
+
+### 5.1 Ordem de locks: wallet `FOR UPDATE` antes do INSERT da transação
+A ordem dentro da transação SQL é: inbox (se vier do SQS) → `SELECT ... FOR UPDATE` na wallet → `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING` da `wager_transaction` → regras, ledger e `UPDATE ... WHERE version = ?` → outbox → commit.
+
+**Por que travar antes de inserir:** o INSERT em `wager_transactions` valida a FK `wallet_id` e, para isso, o Postgres pega `FOR KEY SHARE` na linha da wallet. `FOR KEY SHARE` é compatível com outro `FOR KEY SHARE`, mas **não** com `FOR UPDATE`. Se a ordem fosse inserir e depois travar, duas requisições na mesma wallet fariam: A insere (KEY SHARE), B insere (KEY SHARE), A pede `FOR UPDATE` e espera B, B pede `FOR UPDATE` e espera A. O Postgres detecta o ciclo e aborta uma delas com `40P01` (deadlock). Travando primeiro, a segunda requisição simplesmente espera na fila do `FOR UPDATE`; depois disso, os inserts de transação, ledger e outbox pedem KEY SHARE numa linha que a própria transação já tem em `FOR UPDATE`, o que nunca bloqueia.
+
+**Consequências:**
+- Wallet inexistente aparece no passo do lock (zero linhas), antes de qualquer insert, o que encaixa na decisão 2.7 (404 sem persistir nada).
+- A idempotência continua decidida pela `UNIQUE (idempotency_key)`, não por um SELECT prévio: o `ON CONFLICT` é quem diz se é duplicata. O lock só serializa o acesso à wallet.
+- Custo: um replay também espera o lock da wallet. É aceitável, porque a contenção é por wallet (não há lock global) e o replay é curto.
+
+**Teste:** `test/integration/wallet-lock-order.test.ts`. Um teste de controle reproduz o deadlock de forma determinística com a ordem errada (exige um `40P01`). Os testes de carga disparam 60 apostas distintas e 50 cópias da mesma aposta em paralelo na mesma wallet e falham se **qualquer** transação lançar erro (deadlock incluído). Com a ordem invertida, eles falham listando os `40P01`. Na fatia 4 os testes de carga passam a chamar o use case real.

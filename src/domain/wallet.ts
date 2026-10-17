@@ -36,12 +36,41 @@ export class Wallet {
     private _updatedAt: Date,
   ) {}
 
-  /**
-   * Abre a wallet com saldo zero e version 1. Um saldo inicial não é atribuído aqui: entra por `credit`
-   * dentro de uma transação OPENING, para que exista o lançamento correspondente (version 2).
-   */
+  /** Abre a wallet com saldo zero e version 1, sem lançamento. O primeiro movimento gera a version 2. */
   static open(props: { id: string; playerId: string; currency: string; at: Date }): Wallet {
     return new Wallet(props.id, props.playerId, props.currency, Money.zero(props.currency), 1, props.at, props.at);
+  }
+
+  /**
+   * Abre a wallet já com o saldo inicial e version 1. O lançamento OPENING (CREDIT de 0 até o saldo)
+   * nasce junto, com walletVersion 1: a wallet é criada no estado final, sem passar por uma version 2.
+   * Invariante resultante: version = maior walletVersion do ledger, ou 1 se não houver lançamento.
+   */
+  static openWithBalance(props: {
+    id: string;
+    playerId: string;
+    at: Date;
+    initialBalance: Money;
+    transactionId: string;
+    entryId: string;
+  }): { wallet: Wallet; openingEntry: WalletLedgerEntry } {
+    const { initialBalance } = props;
+    if (!initialBalance.isPositive()) {
+      throw new InvalidAmountError('Initial balance must be positive; use open for a zero balance');
+    }
+    const openingEntry = WalletLedgerEntry.create({
+      id: props.entryId,
+      walletId: props.id,
+      transactionId: props.transactionId,
+      walletVersion: 1,
+      direction: LedgerDirection.Credit,
+      money: initialBalance,
+      balanceBefore: Money.zero(initialBalance.currency),
+      balanceAfter: initialBalance,
+      createdAt: props.at,
+    });
+    const wallet = new Wallet(props.id, props.playerId, initialBalance.currency, initialBalance, 1, props.at, props.at);
+    return { wallet, openingEntry };
   }
 
   /** Reconstrução a partir da persistência: não revalida. */

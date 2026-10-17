@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
-import { createTestOrm, type Sql, sqlRunner, walletsDivergingFromLedger } from './support/database';
+import {
+  createTestOrm, insertWallet, type Sql, sqlRunner, type WalletFixture, walletsDivergingFromLedger,
+} from './support/database';
 
 let orm: MikroORM;
 let sql: Sql;
@@ -29,38 +31,7 @@ async function expectRejected(statement: string, params: unknown[], expected: st
   expect(`${err.constraint ?? ''} ${err.message ?? ''}`).toContain(expected);
 }
 
-interface WalletFixture {
-  walletId: string;
-  playerId: string;
-  openingTxId: string | null;
-}
-
-/** Cria wallet com saldo inicial coerente: transação OPENING e lançamento CREDIT quando > 0. */
-async function createWallet(balance = '100.00', currency = 'BRL'): Promise<WalletFixture> {
-  const walletId = uuid();
-  const playerId = uuid();
-  await sql(`INSERT INTO wallets (id, player_id, currency, balance) VALUES (?, ?, ?, ?)`, [
-    walletId, playerId, currency, balance,
-  ]);
-  if (balance === '0.00') return { walletId, playerId, openingTxId: null };
-
-  const openingTxId = uuid();
-  await sql(
-    `INSERT INTO wager_transactions
-       (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id, player_id,
-        kind, amount, currency, status, balance_after, processed_at)
-     VALUES (?, 'internal', ?, ?, ?, ?, ?, 'OPENING', ?, ?, 'PROCESSED', ?, now())`,
-    [openingTxId, `opening:${walletId}`, `internal:opening:${walletId}`, 'a'.repeat(64), walletId, playerId,
-      balance, currency, balance],
-  );
-  await sql(
-    `INSERT INTO wallet_ledger_entries
-       (id, wallet_id, transaction_id, wallet_version, direction, amount, currency, balance_before, balance_after)
-     VALUES (?, ?, ?, 1, 'CREDIT', ?, ?, '0.00', ?)`,
-    [uuid(), walletId, openingTxId, balance, currency, balance],
-  );
-  return { walletId, playerId, openingTxId };
-}
+const createWallet = (balance = '100.00', currency = 'BRL') => insertWallet(sql, balance, currency);
 
 interface TxOverrides {
   id?: string;
