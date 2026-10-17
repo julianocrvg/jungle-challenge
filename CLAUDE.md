@@ -103,6 +103,7 @@ O mesmo use case atende HTTP e SQS.
 ## Mapeamento HTTP (consistente em todos os endpoints)
 
 - 400: payload inválido
+- 404: recurso inexistente (WALLET_NOT_FOUND, transação não encontrada). Não persiste nada; no SQS, wallet inexistente é erro permanente e vai para a DLQ.
 - 409: conflito de idempotência (mesma key, payload diferente) e wallet duplicada
 - 422: rejeição por regra de negócio (com `failureCode`)
 - 202: aceito com processamento pendente (`PENDING_REFERENCE`)
