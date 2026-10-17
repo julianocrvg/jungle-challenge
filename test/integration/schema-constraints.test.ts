@@ -248,6 +248,25 @@ describe('wager_transactions', () => {
     await expectTxRejected(w, { ...reversal, kind: 'ROLLBACK' }, 'wt_single_reversal_uq');
   });
 
+  test('accepts PLAYER_MISMATCH as a failure code', async () => {
+    const w = await createWallet();
+    await insertTx(w, { status: 'REJECTED', failureCode: 'PLAYER_MISMATCH' });
+  });
+
+  test('provider "internal" is reserved for OPENING, and OPENING only exists with it', async () => {
+    const w = await createWallet();
+    await expectTxRejected(w, { providerId: 'internal' }, 'wt_internal_provider_only_opening');
+    await expectRejected(
+      `INSERT INTO wager_transactions
+         (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id, player_id,
+          kind, amount, currency, status, balance_after, processed_at)
+       VALUES (?, 'provider-a', 'opening-forged', 'provider-a:opening-forged', ?, ?, ?, 'OPENING', '10.00', 'BRL',
+               'PROCESSED', '10.00', now())`,
+      [uuid(), 'a'.repeat(64), w.walletId, w.playerId],
+      'wt_internal_provider_only_opening',
+    );
+  });
+
   test('accepts REFERENCE_NOT_PROCESSED as a failure code', async () => {
     const w = await createWallet();
     await insertTx(w, {

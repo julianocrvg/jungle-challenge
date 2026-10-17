@@ -97,7 +97,7 @@ O mesmo use case atende HTTP e SQS.
 - `PROCESSED`, `REJECTED` e `FAILED` são terminais. Transicionar um terminal lança `InvalidTransactionStateError`.
 - REJECTED não altera saldo nem gera ledger, mas é persistida e idempotente.
 - Reversão que causaria saldo negativo: `REVERSAL_WOULD_OVERDRAW`, distinto de `INSUFFICIENT_FUNDS`.
-- Taxonomia mínima de `failureCode`: `INSUFFICIENT_FUNDS`, `REVERSAL_WOULD_OVERDRAW`, `REFERENCE_NOT_FOUND`, `REFERENCE_NOT_PROCESSED`, `REFERENCE_MISMATCH`, `ALREADY_REVERSED`, `AMOUNT_MISMATCH`, `CURRENCY_MISMATCH`, `INVALID_REFERENCE_KIND`.
+- Taxonomia mínima de `failureCode`: `INSUFFICIENT_FUNDS`, `REVERSAL_WOULD_OVERDRAW`, `REFERENCE_NOT_FOUND`, `REFERENCE_NOT_PROCESSED`, `REFERENCE_MISMATCH`, `ALREADY_REVERSED`, `AMOUNT_MISMATCH`, `CURRENCY_MISMATCH`, `INVALID_REFERENCE_KIND`, `PLAYER_MISMATCH`.
 - Eventos: `WagerTransactionProcessed`, `WagerTransactionRejected`, `WalletBalanceChanged` (só quando o saldo muda), `WagerTransactionPendingReference`. `data` carrega `MoneyProps` (string), nunca a instância de `Money`.
 
 ## Mapeamento HTTP (consistente em todos os endpoints)
@@ -140,6 +140,8 @@ bun test -t "<nome do teste>" # filtro por nome do teste
 ```
 
 Postgres na porta 5433 porque há um PostgreSQL local na 5432. Testes usam o banco `wagering_test` (`TEST_DATABASE_URL`).
+
+Variáveis do banco: `DATABASE_URL`, `DB_POOL_MAX` (default 20) e `DB_LOCK_TIMEOUT_MS` (default 10000, ARCHITECTURE 5.5).
 
 Ajuste os scripts reais em `package.json` e mantenha esta seção atualizada.
 

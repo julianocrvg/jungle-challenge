@@ -23,6 +23,10 @@ describe('WagerTransaction.create', () => {
     expect(tx.isTerminal()).toBe(false);
   });
 
+  test.each(['internal', 'INTERNAL', 'Internal'])('the reserved provider "%s" can never be submitted', (providerId) => {
+    expect(() => newTx({ providerId })).toThrow(InvalidTransactionError);
+  });
+
   test('OPENING can never be submitted', () => {
     expect(() => newTx({ kind: Kind.Opening })).toThrow(InvalidTransactionError);
   });
@@ -130,11 +134,26 @@ describe('state transitions', () => {
     expect(tx.balanceAfter).toBeUndefined();
   });
 
-  test('balanceAfter must be non-negative and in the transaction currency', () => {
+  test('balanceAfter must be non-negative and, when processed, in the transaction currency', () => {
     expect(() => newTx().markProcessed({ balanceAfter: brl('1.00').negate(), at: LATER })).toThrow(InvalidTransactionError);
     expect(() =>
       newTx().markProcessed({ balanceAfter: Money.from({ amount: '1.00', currency: 'USD' }), at: LATER }),
     ).toThrow(InvalidTransactionError);
+    expect(() => newTx().reject(FailureCode.InsufficientFunds, brl('1.00').negate(), LATER)).toThrow(
+      InvalidTransactionError,
+    );
+  });
+
+  test('a CURRENCY_MISMATCH rejection keeps the observed balance in the wallet currency', () => {
+    const tx = newTx({ money: Money.from({ amount: '10.00', currency: 'USD' }) });
+    tx.reject(FailureCode.CurrencyMismatch, brl('100.00'), LATER);
+    expect(tx.balanceAfter?.toJSON()).toEqual({ amount: '100.00', currency: 'BRL' });
+  });
+
+  test('PLAYER_MISMATCH is a rejection code', () => {
+    const tx = newTx();
+    tx.reject(FailureCode.PlayerMismatch, brl('5.00'), LATER);
+    expect(tx.failureCode).toBe('PLAYER_MISMATCH');
   });
 
   describe('PENDING_REFERENCE', () => {

@@ -33,9 +33,18 @@ export const FailureCode = {
   AmountMismatch: 'AMOUNT_MISMATCH',
   CurrencyMismatch: 'CURRENCY_MISMATCH',
   InvalidReferenceKind: 'INVALID_REFERENCE_KIND',
+  /** O playerId da transação não é o dono da wallet. */
+  PlayerMismatch: 'PLAYER_MISMATCH',
   InternalError: 'INTERNAL_ERROR',
 } as const;
 export type FailureCode = (typeof FailureCode)[keyof typeof FailureCode];
+
+/** Provider reservado à OPENING (ARCHITECTURE 5.6). Nenhum provedor externo pode usá-lo. */
+export const INTERNAL_PROVIDER_ID = 'internal';
+
+export function isReservedProviderId(providerId: string): boolean {
+  return providerId.toLowerCase() === INTERNAL_PROVIDER_ID;
+}
 
 /** Resultado de confrontar uma reversão com a transação que ela referencia. */
 export type ReferenceResolution =
@@ -137,6 +146,9 @@ export class WagerTransaction {
         throw new InvalidTransactionError(`${field} is required`);
       }
     }
+    if (isReservedProviderId(props.providerId)) {
+      throw new InvalidTransactionError(`providerId "${INTERNAL_PROVIDER_ID}" is reserved`);
+    }
     if (!SHA256_HEX.test(props.payloadHash)) {
       throw new InvalidTransactionError('payloadHash must be a SHA-256 hex digest');
     }
@@ -178,7 +190,8 @@ export class WagerTransaction {
       throw new InvalidTransactionError('payloadHash must be a SHA-256 hex digest');
     }
     return new WagerTransaction(
-      props.id, 'internal', `opening:${props.walletId}`, `internal:opening:${props.walletId}`, props.payloadHash,
+      props.id, INTERNAL_PROVIDER_ID, `opening:${props.walletId}`, `${INTERNAL_PROVIDER_ID}:opening:${props.walletId}`,
+      props.payloadHash,
       props.walletId, props.playerId, undefined, undefined, WagerTransactionKind.Opening, props.money, undefined,
       props.createdAt, WagerTransactionStatus.Pending, undefined, undefined, undefined, undefined, 0, undefined,
     );
@@ -231,6 +244,9 @@ export class WagerTransaction {
       throw new InvalidTransactionError(`${this.kind} cannot be processed without a resolved reference`);
     }
     this.assertObservedBalance(props.balanceAfter);
+    if (props.balanceAfter.currency !== this.money.currency) {
+      throw new InvalidTransactionError('A processed transaction observes a balance in its own currency');
+    }
     this._status = WagerTransactionStatus.Processed;
     this._referenceTransactionId = props.referenceTransactionId;
     this._balanceAfter = props.balanceAfter;
@@ -259,7 +275,10 @@ export class WagerTransaction {
     this._nextAttemptAt = nextAttemptAt;
   }
 
-  /** Rejeição por regra de negócio: não mexe em saldo, mas guarda o saldo observado para o replay. */
+  /**
+   * Rejeição por regra de negócio: não mexe em saldo, mas guarda o saldo observado para o replay.
+   * O saldo está na moeda da wallet, que difere da transação em CURRENCY_MISMATCH (ARCHITECTURE 5.8).
+   */
   reject(code: FailureCode, balanceAfter: Money, at: Date): void {
     this.assertNotTerminal('reject');
     if (code === FailureCode.InternalError) {
@@ -383,8 +402,8 @@ export class WagerTransaction {
   }
 
   private assertObservedBalance(balanceAfter: Money): void {
-    if (balanceAfter.isNegative() || balanceAfter.currency !== this.money.currency) {
-      throw new InvalidTransactionError('balanceAfter must be a non-negative amount in the transaction currency');
+    if (balanceAfter.isNegative()) {
+      throw new InvalidTransactionError('balanceAfter must be non-negative');
     }
   }
 }

@@ -82,6 +82,7 @@ Uma transação para uma `walletId` que não existe **não é persistida**. A FK
 | `AMOUNT_MISMATCH` | REJECTED | valor diferente do da referência |
 | `CURRENCY_MISMATCH` | REJECTED | moeda da operação diferente da wallet |
 | `INVALID_REFERENCE_KIND` | REJECTED | REFUND sobre algo que não é BET, ou ROLLBACK sobre algo que não é BET, WIN ou REFUND |
+| `PLAYER_MISMATCH` | REJECTED | o `playerId` da transação não é o dono da wallet (seção 5.7, migration 0003) |
 | `INTERNAL_ERROR` | FAILED | erro permanente de infraestrutura, terminal e auditável |
 
 ## 4. Domínio (`src/domain`)
@@ -139,7 +140,9 @@ A ordem dentro da transação SQL é: inbox (se vier do SQS) → `SELECT ... FOR
 - A idempotência continua decidida pela `UNIQUE (idempotency_key)`, não por um SELECT prévio: o `ON CONFLICT` é quem diz se é duplicata. O lock só serializa o acesso à wallet.
 - Custo: um replay também espera o lock da wallet. É aceitável, porque a contenção é por wallet (não há lock global) e o replay é curto.
 
-**Teste:** `test/integration/wallet-lock-order.test.ts`. Um teste de controle reproduz o deadlock de forma determinística com a ordem errada (exige um `40P01`). Os testes de carga disparam 60 apostas distintas e 50 cópias da mesma aposta em paralelo na mesma wallet e falham se **qualquer** transação lançar erro (deadlock incluído). Com a ordem invertida, eles falham listando os `40P01`. Na fatia 4 os testes de carga passam a chamar o use case real.
+- Como o lock vem antes da checagem de idempotência, uma key reaproveitada com um payload que aponta para uma wallet inexistente recebe 404, e não 409. Nada é gravado em nenhum dos dois casos.
+
+**Teste:** `test/integration/wallet-lock-order.test.ts`. Um teste de controle, em SQL, reproduz o deadlock de forma determinística com a ordem errada e exige um `40P01`. Os testes de carga passam pela API, ou seja, pelo use case real: 50 apostas distintas e 50 cópias da mesma aposta em paralelo na mesma wallet. Eles falham com qualquer 5xx e com qualquer log de `40P01` ou `55P03`. Com a ordem invertida (um `FOR KEY SHARE` injetado antes do `FOR UPDATE`), o teste das 50 apostas falha. Um teste de sanidade segura o `FOR UPDATE` numa transação externa, confirma por `pg_stat_activity` que duas requisições ficam bloqueadas e que elas completam depois da liberação.
 
 ### 5.2 Decidir sob o lock e inserir a transação já no estado final
 Com a wallet travada, o use case aplica a regra em memória (domínio) e só então faz o `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING`, já com `status`, `failure_code` e `balance_after` definitivos. Se o INSERT não inserir nada, a decisão é descartada (nada foi gravado), a linha existente é carregada e o `payload_hash` decide entre replay e 409. Se inserir, gravam-se o lançamento, o `UPDATE wallets ... WHERE version = ?` e a outbox. Assim BET, WIN e LOSS nunca fazem UPDATE em `wager_transactions`.

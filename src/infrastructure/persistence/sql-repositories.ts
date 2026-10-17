@@ -1,0 +1,193 @@
+import type { EntityManager } from '@mikro-orm/postgresql';
+import { ExternalTransactionIdConflictError } from '../../application/errors';
+import type {
+  LedgerRepository,
+  OutboxRepository,
+  TransactionalRepositories,
+  WagerTransactionRepository,
+  WalletRepository,
+} from '../../application/ports/unit-of-work';
+import { Money } from '../../domain/money';
+import type { OutboxMessage } from '../../domain/outbox-message';
+import {
+  type FailureCode,
+  WagerTransaction,
+  type WagerTransactionKind,
+  type WagerTransactionStatus,
+} from '../../domain/wager-transaction';
+import { Wallet } from '../../domain/wallet';
+import type { WalletLedgerEntry } from '../../domain/wallet-ledger-entry';
+import { uniqueViolationConstraint } from './database-errors';
+
+/*
+ * Repositórios em SQL explícito (ARCHITECTURE 1.2): cada lock e cada ON CONFLICT fica visível aqui.
+ * Valores monetários entram e saem como string (`::text`), nunca como number.
+ */
+
+type Row = Record<string, unknown>;
+
+const str = (row: Row, column: string): string => row[column] as string;
+const optional = (row: Row, column: string): string | undefined => (row[column] ?? undefined) as string | undefined;
+const date = (row: Row, column: string): Date => row[column] as Date;
+
+class SqlWalletRepository implements WalletRepository {
+  constructor(private readonly em: EntityManager) {}
+
+  async lockById(walletId: string): Promise<Wallet | undefined> {
+    const [row] = await this.em.execute<Row[]>(
+      `SELECT id, player_id, currency, balance::text AS balance, version, created_at, updated_at
+       FROM wallets WHERE id = ? FOR UPDATE`,
+      [walletId],
+    );
+    if (row === undefined) return undefined;
+    return Wallet.rehydrate({
+      id: str(row, 'id'),
+      playerId: str(row, 'player_id'),
+      currency: str(row, 'currency'),
+      balance: Money.from({ amount: str(row, 'balance'), currency: str(row, 'currency') }),
+      version: row.version as number,
+      createdAt: date(row, 'created_at'),
+      updatedAt: date(row, 'updated_at'),
+    });
+  }
+
+  async insertIfAbsent(wallet: Wallet): Promise<boolean> {
+    const rows = await this.em.execute<Row[]>(
+      `INSERT INTO wallets (id, player_id, currency, balance, version, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (player_id, currency) DO NOTHING
+       RETURNING id`,
+      [wallet.id, wallet.playerId, wallet.currency, wallet.balance.toJSON().amount, wallet.version,
+        wallet.createdAt, wallet.updatedAt],
+    );
+    return rows.length === 1;
+  }
+
+  async saveBalance(wallet: Wallet, expectedVersion: number): Promise<void> {
+    const rows = await this.em.execute<Row[]>(
+      `UPDATE wallets SET balance = ?, version = ?, updated_at = ?
+       WHERE id = ? AND version = ?
+       RETURNING id`,
+      [wallet.balance.toJSON().amount, wallet.version, wallet.updatedAt, wallet.id, expectedVersion],
+    );
+    if (rows.length !== 1) {
+      // Com o FOR UPDATE isso não acontece; se acontecer é bug, e a transação inteira é desfeita.
+      throw new Error(`Lost update on wallet ${wallet.id}: version ${expectedVersion} is no longer current`);
+    }
+  }
+}
+
+class SqlWagerTransactionRepository implements WagerTransactionRepository {
+  constructor(private readonly em: EntityManager) {}
+
+  async insertIfAbsent(tx: WagerTransaction): Promise<boolean> {
+    try {
+      const rows = await this.em.execute<Row[]>(
+        `INSERT INTO wager_transactions
+           (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id, player_id,
+            round_id, game_id, kind, amount, currency, reference_external_transaction_id, reference_transaction_id,
+            status, failure_code, balance_after, attempts, next_attempt_at, created_at, processed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (idempotency_key) DO NOTHING
+         RETURNING id`,
+        [
+          tx.id, tx.providerId, tx.externalTransactionId, tx.idempotencyKey, tx.payloadHash, tx.walletId, tx.playerId,
+          tx.roundId ?? null, tx.gameId ?? null, tx.kind, tx.money.toJSON().amount, tx.money.currency,
+          tx.referenceExternalTransactionId ?? null, tx.referenceTransactionId ?? null,
+          tx.status, tx.failureCode ?? null, tx.balanceAfter?.toJSON().amount ?? null, tx.attempts,
+          tx.nextAttemptAt ?? null, tx.createdAt, tx.processedAt ?? null,
+        ],
+      );
+      return rows.length === 1;
+    } catch (error) {
+      // Só esta constraint é um conflito esperado; as demais indicam bug e sobem como estão (500).
+      if (uniqueViolationConstraint(error) === 'wt_provider_external_uq') {
+        throw new ExternalTransactionIdConflictError(
+          'externalTransactionId was already submitted by this provider with another Idempotency-Key',
+          { cause: error },
+        );
+      }
+      throw error;
+    }
+  }
+
+  async findByIdempotencyKey(idempotencyKey: string): Promise<WagerTransaction | undefined> {
+    // O saldo observado está na moeda da wallet (ARCHITECTURE 5.8), por isso o JOIN.
+    const [row] = await this.em.execute<Row[]>(
+      `SELECT t.id, t.provider_id, t.external_transaction_id, t.idempotency_key, t.payload_hash, t.wallet_id,
+              t.player_id, t.round_id, t.game_id, t.kind, t.amount::text AS amount, t.currency,
+              t.reference_external_transaction_id, t.reference_transaction_id, t.status, t.failure_code,
+              t.balance_after::text AS balance_after, t.attempts, t.next_attempt_at, t.created_at, t.processed_at,
+              w.currency AS wallet_currency
+       FROM wager_transactions t JOIN wallets w ON w.id = t.wallet_id
+       WHERE t.idempotency_key = ?`,
+      [idempotencyKey],
+    );
+    if (row === undefined) return undefined;
+    const balanceAfter = optional(row, 'balance_after');
+    return WagerTransaction.rehydrate({
+      id: str(row, 'id'),
+      providerId: str(row, 'provider_id'),
+      externalTransactionId: str(row, 'external_transaction_id'),
+      idempotencyKey: str(row, 'idempotency_key'),
+      payloadHash: str(row, 'payload_hash'),
+      walletId: str(row, 'wallet_id'),
+      playerId: str(row, 'player_id'),
+      roundId: optional(row, 'round_id'),
+      gameId: optional(row, 'game_id'),
+      kind: str(row, 'kind') as WagerTransactionKind,
+      money: Money.from({ amount: str(row, 'amount'), currency: str(row, 'currency') }),
+      referenceExternalTransactionId: optional(row, 'reference_external_transaction_id'),
+      createdAt: date(row, 'created_at'),
+      status: str(row, 'status') as WagerTransactionStatus,
+      referenceTransactionId: optional(row, 'reference_transaction_id'),
+      failureCode: optional(row, 'failure_code') as FailureCode | undefined,
+      balanceAfter:
+        balanceAfter === undefined ? undefined : Money.from({ amount: balanceAfter, currency: str(row, 'wallet_currency') }),
+      processedAt: (row.processed_at ?? undefined) as Date | undefined,
+      attempts: row.attempts as number,
+      nextAttemptAt: (row.next_attempt_at ?? undefined) as Date | undefined,
+    });
+  }
+}
+
+class SqlLedgerRepository implements LedgerRepository {
+  constructor(private readonly em: EntityManager) {}
+
+  async append(entry: WalletLedgerEntry): Promise<void> {
+    await this.em.execute(
+      `INSERT INTO wallet_ledger_entries
+         (id, wallet_id, transaction_id, wallet_version, direction, amount, currency, balance_before, balance_after,
+          created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [entry.id, entry.walletId, entry.transactionId, entry.walletVersion, entry.direction,
+        entry.money.toJSON().amount, entry.money.currency, entry.balanceBefore.toJSON().amount,
+        entry.balanceAfter.toJSON().amount, entry.createdAt],
+    );
+  }
+}
+
+class SqlOutboxRepository implements OutboxRepository {
+  constructor(private readonly em: EntityManager) {}
+
+  async append(messages: readonly OutboxMessage[]): Promise<void> {
+    for (const message of messages) {
+      await this.em.execute(
+        `INSERT INTO outbox (id, aggregate_id, event_type, payload, occurred_at, attempts, next_attempt_at)
+         VALUES (?, ?, ?, ?::jsonb, ?, ?, ?)`,
+        [message.id, message.aggregateId, message.eventType, JSON.stringify(message.payload), message.occurredAt,
+          message.attempts, message.nextAttemptAt],
+      );
+    }
+  }
+}
+
+/** Repositórios ligados ao EntityManager da transação corrente. */
+export function sqlRepositories(em: EntityManager): TransactionalRepositories {
+  return {
+    wallets: new SqlWalletRepository(em),
+    transactions: new SqlWagerTransactionRepository(em),
+    ledger: new SqlLedgerRepository(em),
+    outbox: new SqlOutboxRepository(em),
+  };
+}

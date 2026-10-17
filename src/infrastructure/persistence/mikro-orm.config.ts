@@ -1,20 +1,20 @@
 import { defineConfig } from '@mikro-orm/postgresql';
 import { Migrator } from '@mikro-orm/migrations';
+import { DEFAULT_POOL_MAX, databaseSettingsFromEnv } from '../../config';
 import { migrations } from './migrations';
 
-export const DEFAULT_DATABASE_URL = 'postgres://wagering:wagering@localhost:5433/wagering';
-
 export function databaseUrl(): string {
-  return process.env.DATABASE_URL ?? DEFAULT_DATABASE_URL;
+  return databaseSettingsFromEnv().url;
 }
 
-export function createOrmConfig(clientUrl: string = databaseUrl()) {
+export function createOrmConfig(clientUrl: string = databaseUrl(), options: { poolMax?: number } = {}) {
   return defineConfig({
     clientUrl,
-    // Entidades de persistência (EntitySchema) entram a partir da fatia 3.
+    // Sem entidades: os comandos usam SQL explícito (ARCHITECTURE 1.2), e as leituras entram na fatia 5.
     entities: [],
     discovery: { warnWhenNoEntities: false },
     extensions: [Migrator],
+    pool: { min: 0, max: options.poolMax ?? DEFAULT_POOL_MAX },
     migrations: {
       tableName: 'mikro_orm_migrations',
       migrationsList: migrations,
