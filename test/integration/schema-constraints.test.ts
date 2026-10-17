@@ -265,8 +265,23 @@ describe('wager_transactions', () => {
 
     await insertTx(w, refund);
     await expectTxRejected(w, refund, 'wt_single_reversal_uq');
-    // tipo diferente sobre a mesma referência não é bloqueado pelo índice
-    await insertTx(w, { ...refund, kind: 'ROLLBACK' });
+  });
+
+  test('a reference is reversed once in total: REFUND then ROLLBACK of the same BET violates the index', async () => {
+    const w = await createWallet();
+    const betId = uuid();
+    await insertTx(w, { id: betId, externalId: 'bet-total' });
+    const reversal = { referenceExternalId: 'bet-total', referenceTxId: betId };
+
+    await insertTx(w, { ...reversal, kind: 'REFUND' });
+    await expectTxRejected(w, { ...reversal, kind: 'ROLLBACK' }, 'wt_single_reversal_uq');
+  });
+
+  test('accepts REFERENCE_NOT_PROCESSED as a failure code', async () => {
+    const w = await createWallet();
+    await insertTx(w, {
+      kind: 'REFUND', referenceExternalId: 'bet-failed', status: 'REJECTED', failureCode: 'REFERENCE_NOT_PROCESSED',
+    });
   });
 
   test('a REJECTED reversal does not block a later PROCESSED one', async () => {

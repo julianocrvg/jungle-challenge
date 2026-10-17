@@ -46,7 +46,9 @@ Usei `TEXT + CHECK` em vez de `CREATE TYPE`. Acrescentar um valor vira só troca
 - `round_id` e `game_id` são obrigatórios, exceto em `OPENING`, que é interno e não pertence a uma rodada.
 - `attempts` e `next_attempt_at` servem ao worker de `PENDING_REFERENCE`, que usa o índice parcial `wt_pending_reference_due_idx`.
 
-**Dupla reversão (`wt_single_reversal_uq`):** é um índice único parcial em `(reference_transaction_id, kind) WHERE kind IN ('REFUND','ROLLBACK') AND status = 'PROCESSED'`. Duas instâncias que tentem reverter a mesma BET em paralelo esbarram no índice no commit, e só uma vence. O filtro em `PROCESSED` deixa uma reversão `REJECTED` (por exemplo, `REVERSAL_WOULD_OVERDRAW`) auditável sem bloquear uma tentativa legítima posterior. REFUND e ROLLBACK sobre a mesma referência são tipos distintos e não se bloqueiam, conforme a regra 7.4 ("pelo mesmo tipo").
+**Dupla reversão (`wt_single_reversal_uq`):** é um índice único parcial em `(reference_transaction_id) WHERE kind IN ('REFUND','ROLLBACK') AND status = 'PROCESSED'`. **Interpretação adotada:** uma referência só pode ser revertida **uma vez no total, por qualquer tipo**. Reverter a mesma BET com um REFUND e depois com um ROLLBACK (ou o contrário) creditaria o jogador duas vezes pelo mesmo débito; a regra 7.4 do enunciado ("pelo mesmo tipo") foi lida de forma mais estrita por segurança financeira. Duas instâncias que tentem reverter a mesma referência em paralelo esbarram no índice no commit, e só uma vence. O filtro em `PROCESSED` deixa uma reversão `REJECTED` (por exemplo, `REVERSAL_WOULD_OVERDRAW`) auditável sem bloquear uma tentativa legítima posterior. A mudança veio na migration `…0002` (o índice inicial era `(reference_transaction_id, kind)`).
+
+**Ordem obrigatória no use case:** (1) travar a wallet com `FOR UPDATE` **antes** de avaliar qualquer regra; (2) sob o lock, checar se a referência já foi revertida (`ALREADY_REVERSED`) **antes** de inserir ou marcar a reversão como `PROCESSED`. O índice é a rede de proteção final, não o caminho normal: se o use case dependesse dele, a violação abortaria a transação em vez de produzir uma rejeição auditável.
 
 ### 2.5 `wallet_ledger_entries`
 - `UNIQUE (wallet_id, transaction_id)`: no máximo um lançamento por transação.
@@ -74,8 +76,9 @@ Uma transação para uma `walletId` que não existe **não é persistida**. A FK
 | `INSUFFICIENT_FUNDS` | REJECTED | BET maior que o saldo |
 | `REVERSAL_WOULD_OVERDRAW` | REJECTED | reversão deixaria o saldo negativo |
 | `REFERENCE_NOT_FOUND` | REJECTED | referência não apareceu dentro do limite de tentativas |
+| `REFERENCE_NOT_PROCESSED` | REJECTED | a referência existe, mas terminou `REJECTED` ou `FAILED`: não há efeito a reverter |
 | `REFERENCE_MISMATCH` | REJECTED | referência de outro player, wallet, moeda ou rodada |
-| `ALREADY_REVERSED` | REJECTED | referência já revertida por esse tipo |
+| `ALREADY_REVERSED` | REJECTED | referência já revertida (por REFUND ou ROLLBACK) |
 | `AMOUNT_MISMATCH` | REJECTED | valor diferente do da referência |
 | `CURRENCY_MISMATCH` | REJECTED | moeda da operação diferente da wallet |
 | `INVALID_REFERENCE_KIND` | REJECTED | REFUND sobre algo que não é BET, ou ROLLBACK sobre algo que não é BET, WIN ou REFUND |

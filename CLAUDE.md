@@ -77,7 +77,7 @@ O mesmo use case atende HTTP e SQS.
 
 **Schema (aplicado no banco):**
 - `wallets`: `UNIQUE(player_id, currency)`, `CHECK(balance >= 0)`
-- `wager_transactions`: `UNIQUE(idempotency_key)`, `UNIQUE(provider_id, external_transaction_id)`, `CHECK` de referência obrigatória para REFUND e ROLLBACK, índice único parcial contra dupla reversão
+- `wager_transactions`: `UNIQUE(idempotency_key)`, `UNIQUE(provider_id, external_transaction_id)`, `CHECK` de referência obrigatória para REFUND e ROLLBACK, índice único parcial em `(reference_transaction_id)` contra dupla reversão
 - `wallet_ledger_entries`: `UNIQUE(wallet_id, transaction_id)` e trigger que bloqueia UPDATE e DELETE
 - `inbox`: PK `(consumer_name, message_id)`
 - `outbox`: índice parcial em `(next_attempt_at) WHERE published_at IS NULL`
@@ -93,11 +93,11 @@ O mesmo use case atende HTTP e SQS.
 - Modelagem: construtor `private`, factories estáticas (`create`, `from`, `rehydrate`). `rehydrate` não revalida transições.
 - Fluxos: BET leva a WIN, LOSS, REFUND ou ROLLBACK. `OPENING` é interno e nunca entra pela API nem pela fila.
 - BET: débito, rejeita se saldo insuficiente. WIN e REFUND: crédito. LOSS: sem efeito no saldo e sem ledger. ROLLBACK: inverso da referência.
-- REFUND só referencia BET. ROLLBACK referencia BET, WIN ou REFUND. Ambos exigem `referenceExternalTransactionId`, resolvido por `(providerId, referenceExternalTransactionId)`, que deve ter o mesmo provider, player, wallet, moeda e rodada. O valor deve ser igual ao da referência. Uma referência não pode ser revertida duas vezes pelo mesmo tipo.
+- REFUND só referencia BET. ROLLBACK referencia BET, WIN ou REFUND. Ambos exigem `referenceExternalTransactionId`, resolvido por `(providerId, referenceExternalTransactionId)`, que deve ter o mesmo provider, player, wallet, moeda e rodada. O valor deve ser igual ao da referência. Uma referência só pode ser revertida uma vez no total, por qualquer tipo (REFUND ou ROLLBACK; interpretação mais estrita que o enunciado, ver ARCHITECTURE.md 2.4).
 - `PROCESSED`, `REJECTED` e `FAILED` são terminais. Transicionar um terminal lança `InvalidTransactionStateError`.
 - REJECTED não altera saldo nem gera ledger, mas é persistida e idempotente.
 - Reversão que causaria saldo negativo: `REVERSAL_WOULD_OVERDRAW`, distinto de `INSUFFICIENT_FUNDS`.
-- Taxonomia mínima de `failureCode`: `INSUFFICIENT_FUNDS`, `REVERSAL_WOULD_OVERDRAW`, `REFERENCE_NOT_FOUND`, `REFERENCE_MISMATCH`, `ALREADY_REVERSED`, `AMOUNT_MISMATCH`, `CURRENCY_MISMATCH`, `INVALID_REFERENCE_KIND`.
+- Taxonomia mínima de `failureCode`: `INSUFFICIENT_FUNDS`, `REVERSAL_WOULD_OVERDRAW`, `REFERENCE_NOT_FOUND`, `REFERENCE_NOT_PROCESSED`, `REFERENCE_MISMATCH`, `ALREADY_REVERSED`, `AMOUNT_MISMATCH`, `CURRENCY_MISMATCH`, `INVALID_REFERENCE_KIND`.
 - Eventos: `WagerTransactionProcessed`, `WagerTransactionRejected`, `WalletBalanceChanged` (só quando o saldo muda), `WagerTransactionPendingReference`. `data` carrega `MoneyProps` (string), nunca a instância de `Money`.
 
 ## Mapeamento HTTP (consistente em todos os endpoints)
