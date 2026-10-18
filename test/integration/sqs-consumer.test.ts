@@ -21,7 +21,7 @@ import {
   sendMessages,
 } from './support/consumer';
 import { createTestOrm, insertWallet, type Sql, sqlRunner, walletsDivergingFromLedger, type WalletFixture } from './support/database';
-import { SQS, waitFor } from './support/outbox';
+import { CapturingStructuredLogger, SQS, waitFor } from './support/outbox';
 
 /*
  * Consumidor de wager-transactions.fifo contra Postgres e LocalStack reais (ARCHITECTURE 7). Cada teste tem a
@@ -33,6 +33,9 @@ let sql: Sql;
 let client: SQSClient;
 let queues: QueuePair;
 const running: WagerTransactionsConsumer[] = [];
+const loggers: CapturingStructuredLogger[] = [];
+/** Um valor monetário (`25.00`), o objeto `money` ou o campo `amount`: nada disso pode aparecer num log. */
+const MONETARY = /\d+\.\d{2}(?!\d)|"money"|"amount"/;
 
 beforeAll(async () => {
   orm = await createTestOrm();
@@ -46,6 +49,9 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await Promise.all(running.splice(0).map((c) => c.stop()));
+  // Nenhum log do consumidor traz o corpo da mensagem nem valores monetários (ARCHITECTURE 7.8).
+  const leaked = loggers.splice(0).flatMap((l) => l.entries).filter((e) => MONETARY.test(JSON.stringify(e)));
+  expect(leaked).toEqual([]);
   await client.send(new DeleteQueueCommand({ QueueUrl: queues.queueUrl }));
   await client.send(new DeleteQueueCommand({ QueueUrl: queues.dlqUrl }));
   // Invariante de todos os testes: saldo materializado == saldo reconstruído pelo ledger.
@@ -61,6 +67,7 @@ function start(setup: Omit<Parameters<typeof buildConsumer>[0], 'orm' | 'queues'
   const built = buildConsumer({ orm, queues, client, ...setup });
   built.consumer.start();
   running.push(built.consumer);
+  loggers.push(built.logger);
   return built;
 }
 
@@ -148,12 +155,17 @@ describe('SQS consumer', () => {
   test('poison messages go to the DLQ with a reason and do not block the wallet group', async () => {
     const wallet = await insertWallet(sql);
     const group = wallet.walletId;
-    const first = envelope(betData(wallet));
+    const firstData = betData(wallet);
+    const first = envelope(firstData);
     const ghost: WalletFixture = { walletId: Bun.randomUUIDv7(), playerId: wallet.playerId, openingTxId: null };
     await sendMessages(client, queues.queueUrl, [
       { body: '{not json', groupId: group },
       { body: first, groupId: group },
       { body: { ...envelope(betData(wallet, { money: { amount: '99.00', currency: 'BRL' } })), messageId: first.messageId }, groupId: group },
+      // Mesma key (default) com outro valor, messageId novo: 409 da idempotência, pelo caminho real da UoW.
+      { body: envelope({ ...firstData, money: { amount: '7.00', currency: 'BRL' } }), groupId: group },
+      // Mesmo externalTransactionId com outra key: violação de wt_provider_external_uq.
+      { body: envelope({ ...firstData, idempotencyKey: 'provider-a:another-key' }), groupId: group },
       { body: { ...envelope(betData(wallet)), type: 'WalletCreated' }, groupId: group },
       { body: envelope(betData(wallet, { kind: 'OPENING' })), groupId: group },
       { body: envelope(betData(ghost)), groupId: group },
@@ -167,10 +179,12 @@ describe('SQS consumer', () => {
     // Muito antes da visibilidade de 30 s: nenhuma mensagem venenosa segurou o grupo.
     expect(Date.now() - startedAt).toBeLessThan(15_000);
 
-    const dead = await receiveDeadLetters(client, queues.dlqUrl, 5);
-    expect(dead.map((d) => d.reason).sort()).toEqual(
-      ['INBOX_MESSAGE_CONFLICT', 'INVALID_JSON', 'INVALID_PAYLOAD', 'UNKNOWN_MESSAGE_TYPE', 'WALLET_NOT_FOUND'],
-    );
+    const dead = await receiveDeadLetters(client, queues.dlqUrl, 7);
+    expect(dead.map((d) => d.reason).sort()).toEqual([
+      'EXTERNAL_TRANSACTION_ID_CONFLICT', 'IDEMPOTENCY_KEY_CONFLICT', 'INBOX_MESSAGE_CONFLICT', 'INVALID_JSON',
+      'INVALID_PAYLOAD', 'UNKNOWN_MESSAGE_TYPE', 'WALLET_NOT_FOUND',
+    ]);
+    expect(metrics.counter('sqs_consumer_retries_total', { reason: 'UNEXPECTED_ERROR' })).toBe(0);
     // A DLQ preserva o corpo e o grupo originais: reenviar dela para a fila é seguro (ARCHITECTURE 7.6).
     expect(dead.every((d) => d.groupId === group)).toBe(true);
     expect(dead.find((d) => d.reason === 'INVALID_JSON')?.body).toBe('{not json');
@@ -199,7 +213,8 @@ describe('SQS consumer', () => {
 
   test.each([
     ['transient', () => new TransientInfrastructureError('injected'), 'SERVICE_UNAVAILABLE'],
-    ['unexpected', () => new TypeError('injected bug'), 'UNEXPECTED_ERROR'],
+    // A mensagem do erro cita um valor e um pedaço do corpo: o log não pode repetir nenhum dos dois.
+    ['unexpected', () => new TypeError('bug while debiting 10.00 from {"money":{"amount":"10.00"}}'), 'UNEXPECTED_ERROR'],
   ])('a %s failure that persists goes to the DLQ after the attempt limit; the BET behind it is processed', async (_, makeError, detail) => {
     const wallet = await insertWallet(sql);
     const leader = envelope(betData(wallet));
@@ -224,7 +239,8 @@ describe('SQS consumer', () => {
     if (detail === 'UNEXPECTED_ERROR') {
       const errors = logger.entries.filter((e) => e.level === 'error');
       expect(errors.length).toBeGreaterThan(0);
-      expect(errors.every((e) => typeof e.fields.stack === 'string' && !JSON.stringify(e.fields).includes('"amount"'))).toBe(true);
+      // Os frames do stack ficam (diagnóstico); a mensagem do erro, não. O afterEach confere os valores.
+      expect(errors.every((e) => String(e.fields.stack).includes(' at ') && !String(e.fields.stack).includes('bug while'))).toBe(true);
     }
   }, 40_000);
 

@@ -219,9 +219,9 @@ export class WagerTransactionsConsumer {
     if (disposition.kind === 'permanent') return this.deadLetter(message, disposition.reason, detailOf(error), context);
 
     if (disposition.unexpected) {
-      // Bug: stack para diagnóstico, nunca o corpo da mensagem.
+      // Bug: só os frames do stack. A mensagem do erro é texto livre (pode citar valores ou o SQL) e fica fora.
       this.logger.error('Unexpected error processing wager message', {
-        ...context, errorName: errorName(error), stack: error instanceof Error ? error.stack : String(error),
+        ...context, errorName: errorName(error), sqlState: sqlStateOf(error), stack: stackFrames(error),
       });
     }
     // Para falhas de banco, o SQLSTATE (55P03, 40P01...) é o motivo mais útil na métrica.
@@ -297,6 +297,15 @@ export class WagerTransactionsConsumer {
 
 function errorName(error: unknown): string {
   return error instanceof Error ? error.name : 'unknown';
+}
+
+/**
+ * Só as linhas `at ...` do stack. A primeira linha do `stack` repete `Nome: mensagem`, e a mensagem de um erro
+ * inesperado é texto livre (um bug, ou o Postgres citando o valor que recusou), então não entra no log.
+ */
+export function stackFrames(error: unknown): string {
+  if (!(error instanceof Error) || error.stack === undefined) return '';
+  return error.stack.split('\n').filter((line) => /^\s+at /.test(line)).join('\n');
 }
 
 /** Detalhe curto para o atributo da DLQ: as mensagens dos nossos erros não carregam o payload. */
