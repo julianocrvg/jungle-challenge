@@ -20,12 +20,17 @@ import {
   databaseSettingsFromEnv,
   type OutboxSettings,
   outboxSettingsFromEnv,
+  type PendingReferenceSettings,
+  pendingReferenceSettingsFromEnv,
   type SqsSettings,
   sqsSettingsFromEnv,
   validateConsumerSettings,
   validateOutboxSettings,
+  validatePendingReferenceSettings,
+  validatePoolBudget,
 } from './config';
 import { DEFAULT_BACKOFF } from './domain/backoff';
+import type { PendingReferencePolicy } from './domain/pending-reference-policy';
 import { SqsMessageQueue } from './infrastructure/messaging/sqs-message-queue';
 import { WagerTransactionsConsumer } from './interface/workers/wager-transactions-consumer.worker';
 import { SystemClock } from './infrastructure/clock/system-clock';
@@ -46,6 +51,7 @@ export interface AppOptions {
   sqs?: Partial<SqsSettings>;
   outbox?: Partial<OutboxSettings>;
   consumer?: Partial<ConsumerSettings>;
+  pendingReference?: Partial<PendingReferenceSettings>;
   idGenerator?: IdGenerator;
   clock?: Clock;
   eventPublisher?: EventPublisher;
@@ -66,7 +72,20 @@ export class AppModule {
     const outbox = { ...outboxSettingsFromEnv(), ...options.outbox };
     validateOutboxSettings(outbox);
     const consumer = { ...consumerSettingsFromEnv(), ...options.consumer };
-    if (consumer.enabled) validateConsumerSettings(consumer, database, outbox.enabled);
+    if (consumer.enabled) validateConsumerSettings(consumer, database);
+    const pending = { ...pendingReferenceSettingsFromEnv(), ...options.pendingReference };
+    validatePendingReferenceSettings(pending);
+    validatePoolBudget(database, {
+      consumerConcurrency: consumer.enabled ? consumer.concurrency : 0,
+      outboxPublishers: outbox.enabled ? 1 : 0,
+      pendingReferenceConcurrency: pending.enabled ? pending.concurrency : 0,
+    });
+    // A mesma política na submissão (primeiro next_attempt_at) e no resolve (os seguintes e o prazo).
+    const pendingPolicy: PendingReferencePolicy = {
+      ttlMs: pending.ttlMs,
+      maxAttempts: pending.maxAttempts,
+      backoff: { baseMs: pending.backoffBaseMs, maxMs: pending.backoffMaxMs },
+    };
     const useCaseDeps = [UNIT_OF_WORK, ID_GENERATOR, CLOCK];
     return {
       module: AppModule,
@@ -92,12 +111,14 @@ export class AppModule {
         },
         {
           provide: SubmitWagerTransaction,
-          useFactory: (uow: UnitOfWork, ids: IdGenerator, clock: Clock) => new SubmitWagerTransaction(uow, ids, clock),
+          useFactory: (uow: UnitOfWork, ids: IdGenerator, clock: Clock) =>
+            new SubmitWagerTransaction(uow, ids, clock, pendingPolicy),
           inject: useCaseDeps,
         },
         {
           provide: ResolvePendingReference,
-          useFactory: (uow: UnitOfWork, ids: IdGenerator, clock: Clock) => new ResolvePendingReference(uow, ids, clock),
+          useFactory: (uow: UnitOfWork, ids: IdGenerator, clock: Clock) =>
+            new ResolvePendingReference(uow, ids, clock, pendingPolicy),
           inject: useCaseDeps,
         },
         {

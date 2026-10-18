@@ -13,9 +13,12 @@ import type { WagerTransactionRepository } from '../ports/unit-of-work';
 
 /**
  * `decided`: a transação ficou PROCESSED ou REJECTED (com o lançamento, quando o saldo mudou).
- * `wait`: reversão sem referência utilizável; quem chama decide entre PENDING_REFERENCE e novo retry.
+ * `wait`: reversão sem referência utilizável; quem chama decide entre PENDING_REFERENCE, novo retry ou
+ * expiração. `reference` é a referência encontrada mas ainda não aplicada (ausente: não encontrada).
  */
-export type RuleOutcome = { kind: 'decided'; entry?: WalletLedgerEntry } | { kind: 'wait' };
+export type RuleOutcome =
+  | { kind: 'decided'; entry?: WalletLedgerEntry }
+  | { kind: 'wait'; reference: WagerTransaction | undefined };
 
 /**
  * Regras de negócio com a wallet JÁ travada (`FOR UPDATE`). Usada pela submissão e pelo resolve de
@@ -83,7 +86,7 @@ async function decideReversal(
     tx.referenceExternalTransactionId as string,
   );
   const resolution = tx.validateReference(reference);
-  if (resolution.outcome === 'wait') return { kind: 'wait' };
+  if (resolution.outcome === 'wait') return { kind: 'wait', reference };
   // Daqui em diante a referência existe; guardar o vínculo deixa a rejeição auditável.
   const ref = reference as WagerTransaction;
   if (resolution.outcome === 'reject') {

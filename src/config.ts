@@ -144,13 +144,12 @@ export function consumerProcessingBudgetMs(database: Pick<DatabaseSettings, 'loc
 }
 
 /**
- * - Visibilidade menor que lock_timeout + margem: a mensagem reapareceria para outro consumidor enquanto a
- *   primeira ainda espera o lock, gerando trabalho duplicado (a inbox deduplica, mas é desperdício e contenção).
- * - Concorrência: cada mensagem em andamento segura uma conexão. Somada ao publisher da outbox, precisa ficar
- *   abaixo do pool, para sobrar conexão para o HTTP e para o health check.
+ * Visibilidade menor que lock_timeout + margem: a mensagem reapareceria para outro consumidor enquanto a
+ * primeira ainda espera o lock, gerando trabalho duplicado (a inbox deduplica, mas é desperdício e contenção).
+ * A concorrência é conferida junto com os outros workers em `validatePoolBudget`.
  */
 export function validateConsumerSettings(
-  settings: ConsumerSettings, database: Pick<DatabaseSettings, 'poolMax' | 'lockTimeoutMs'>, outboxEnabled: boolean,
+  settings: ConsumerSettings, database: Pick<DatabaseSettings, 'lockTimeoutMs'>,
 ): void {
   if (settings.waitTimeSeconds > 20) {
     throw new Error(`SQS_CONSUMER_WAIT_SECONDS must be at most 20, got ${settings.waitTimeSeconds}`);
@@ -161,15 +160,80 @@ export function validateConsumerSettings(
       + `got ${settings.visibilityTimeoutSeconds} s for a lock timeout of ${database.lockTimeoutMs} ms`,
     );
   }
-  const reserved = settings.concurrency + (outboxEnabled ? 1 : 0);
-  if (reserved >= database.poolMax) {
-    throw new Error(
-      `SQS_CONSUMER_CONCURRENCY (${settings.concurrency})${outboxEnabled ? ' + outbox publisher (1)' : ''} `
-      + `must be below DB_POOL_MAX (${database.poolMax})`,
-    );
-  }
   if (settings.backoffMaxMs > MAX_VISIBILITY_MS || settings.backoffBaseMs > settings.backoffMaxMs) {
     throw new Error('SQS_CONSUMER_BACKOFF_BASE_MS <= SQS_CONSUMER_BACKOFF_MAX_MS <= 12 h is required');
+  }
+}
+
+export interface PendingReferenceSettings {
+  /** Liga o worker de PENDING_REFERENCE nesta instância. */
+  enabled: boolean;
+  /** Espera entre ciclos quando o lote veio incompleto ou algum item falhou. */
+  pollIntervalMs: number;
+  /** Pendentes vencidas listadas por ciclo. */
+  batchSize: number;
+  /** Resolves em paralelo, cada um com uma conexão: entra no orçamento do pool (validado). */
+  concurrency: number;
+  /** Prazo da espera a partir de `created_at` (ARCHITECTURE 8.3). */
+  ttlMs: number;
+  /** Rede de segurança: tentativas de resolução antes de expirar. */
+  maxAttempts: number;
+  backoffBaseMs: number;
+  backoffMaxMs: number;
+}
+
+export const DEFAULT_PENDING_REFERENCE_SETTINGS: Omit<PendingReferenceSettings, 'enabled'> = {
+  pollIntervalMs: 1_000,
+  batchSize: 50,
+  concurrency: 4,
+  ttlMs: 60 * 60_000,
+  maxAttempts: 30,
+  backoffBaseMs: 1_000,
+  backoffMaxMs: 5 * 60_000,
+};
+
+export function pendingReferenceSettingsFromEnv(
+  env: Record<string, string | undefined> = process.env,
+): PendingReferenceSettings {
+  const d = DEFAULT_PENDING_REFERENCE_SETTINGS;
+  return {
+    enabled: env.PENDING_REFERENCE_WORKER_ENABLED !== 'false',
+    pollIntervalMs: positiveInteger(env, 'PENDING_REFERENCE_POLL_INTERVAL_MS', d.pollIntervalMs),
+    batchSize: positiveInteger(env, 'PENDING_REFERENCE_BATCH_SIZE', d.batchSize),
+    concurrency: positiveInteger(env, 'PENDING_REFERENCE_CONCURRENCY', d.concurrency),
+    ttlMs: positiveInteger(env, 'PENDING_REFERENCE_TTL_MS', d.ttlMs),
+    maxAttempts: positiveInteger(env, 'PENDING_REFERENCE_MAX_ATTEMPTS', d.maxAttempts),
+    backoffBaseMs: positiveInteger(env, 'PENDING_REFERENCE_BACKOFF_BASE_MS', d.backoffBaseMs),
+    backoffMaxMs: positiveInteger(env, 'PENDING_REFERENCE_BACKOFF_MAX_MS', d.backoffMaxMs),
+  };
+}
+
+export function validatePendingReferenceSettings(settings: PendingReferenceSettings): void {
+  if (settings.backoffBaseMs > settings.backoffMaxMs) {
+    throw new Error('PENDING_REFERENCE_BACKOFF_BASE_MS must not exceed PENDING_REFERENCE_BACKOFF_MAX_MS');
+  }
+}
+
+/** Conexões que os workers nunca podem ocupar: ficam para o HTTP e o health check (ARCHITECTURE 8.5). */
+export const HTTP_RESERVED_CONNECTIONS = 5;
+
+/**
+ * Cada unidade de trabalho de um worker segura uma conexão do pool: mensagem do consumidor, lote do publisher,
+ * resolve de pendente. Somados, ficam em no máximo DB_POOL_MAX - 5, para que um pico nos workers nunca deixe
+ * o HTTP sem conexão. Com os defaults: 10 + 1 + 4 = 15 = 20 - 5.
+ */
+export function validatePoolBudget(
+  database: Pick<DatabaseSettings, 'poolMax'>,
+  workers: { consumerConcurrency: number; outboxPublishers: number; pendingReferenceConcurrency: number },
+): void {
+  const used = workers.consumerConcurrency + workers.outboxPublishers + workers.pendingReferenceConcurrency;
+  const available = database.poolMax - HTTP_RESERVED_CONNECTIONS;
+  if (used > available) {
+    throw new Error(
+      `Workers need ${used} connections (SQS_CONSUMER_CONCURRENCY ${workers.consumerConcurrency} + outbox publisher `
+      + `${workers.outboxPublishers} + PENDING_REFERENCE_CONCURRENCY ${workers.pendingReferenceConcurrency}), `
+      + `but at most DB_POOL_MAX (${database.poolMax}) - ${HTTP_RESERVED_CONNECTIONS} reserved for HTTP = ${available} are allowed`,
+    );
   }
 }
 

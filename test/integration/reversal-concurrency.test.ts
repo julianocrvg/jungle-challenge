@@ -1,7 +1,9 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { ResolvePendingReference } from '../../src/application/wagering/resolve-pending-reference';
+import { DEFAULT_PENDING_REFERENCE_POLICY } from '../../src/domain/pending-reference-policy';
 import { createTestOrm, type Sql, sqlRunner, walletsDivergingFromLedger } from './support/database';
 import { createWalletViaApi, startTestApp, submit, type TestApp, wagerPayload, type WalletBody } from './support/app';
+import { ManualClock } from './support/outbox';
 
 /*
  * Corridas reais (Promise.all contra a API, cada requisição numa conexão própria do pool). Cada cenário roda
@@ -14,14 +16,18 @@ let api: TestApp;
 let sql: Sql;
 let resolver: ResolvePendingReference;
 let closeOrm: () => Promise<void>;
+const clock = new ManualClock(new Date());
 
 beforeAll(async () => {
   const orm = await createTestOrm();
   sql = sqlRunner(orm);
   closeOrm = () => orm.close(true);
-  api = await startTestApp();
+  api = await startTestApp({ clock });
   resolver = api.app.get(ResolvePendingReference);
 });
+
+/** O resolve só age em pendentes vencidas: avança o relógio um degrau máximo do backoff antes de chamá-lo. */
+const makeDue = () => clock.advance(DEFAULT_PENDING_REFERENCE_POLICY.backoff.maxMs);
 
 afterAll(async () => {
   await api?.close();
@@ -96,6 +102,7 @@ describe('ResolvePendingReference in parallel for the same transaction', () => {
       const bet = await submit(api, wagerPayload(w, { externalTransactionId: betExternalId, money: brl('30.00') }));
       expect(bet.status).toBe(200);
 
+      makeDue();
       const outcomes = await Promise.all([
         resolver.execute(refund.body.transactionId as string),
         resolver.execute(refund.body.transactionId as string),
@@ -123,6 +130,7 @@ describe('REFUND and its BET in parallel', () => {
       orders.add(refund.body.status as string);
 
       if (refund.status === 202) {
+        makeDue();
         expect((await resolver.execute(refund.body.transactionId as string)).outcome).toBe('resolved');
       }
       const [row] = await sql(`SELECT status FROM wager_transactions WHERE id = ?`, [refund.body.transactionId]);

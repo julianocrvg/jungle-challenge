@@ -6,6 +6,7 @@ import {
   type SubmitWagerTransactionCommand,
   SubmitWagerTransaction,
 } from '../../src/application/wagering/submit-wager-transaction';
+import { DEFAULT_PENDING_REFERENCE_POLICY } from '../../src/domain/pending-reference-policy';
 import { WagerTransactionKind } from '../../src/domain/wager-transaction';
 import { BunIdGenerator } from '../../src/infrastructure/id/bun-id-generator';
 import { createSqsClient } from '../../src/infrastructure/messaging/sqs-event-publisher';
@@ -120,7 +121,9 @@ describe('SQS consumer under concurrency', () => {
   }, 120_000);
 
   test('two simultaneous executions with the same messageId: one effect, the other a duplicate, no 23505', async () => {
-    const submit = new SubmitWagerTransaction(new MikroOrmUnitOfWork(orm, 10_000), new BunIdGenerator(), { now: () => new Date() });
+    const submit = new SubmitWagerTransaction(
+      new MikroOrmUnitOfWork(orm, 10_000), new BunIdGenerator(), { now: () => new Date() }, DEFAULT_PENDING_REFERENCE_POLICY,
+    );
     for (let round = 0; round < 20; round++) {
       const wallet = await insertWallet(sql, '100.00');
       const messageId = `msg-${Bun.randomUUIDv7()}`;

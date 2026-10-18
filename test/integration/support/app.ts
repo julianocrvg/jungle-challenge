@@ -68,6 +68,8 @@ export async function startTestApp(options: CreateAppOptions = {}): Promise<Test
     outbox: { enabled: false, ...options.outbox },
     // Idem para o consumidor: os testes da fila montam o seu, com filas temporárias.
     consumer: { enabled: false, ...options.consumer },
+    // Idem para o worker de pendentes: os testes chamam o resolve ou o ciclo do worker diretamente.
+    pendingReference: { enabled: false, ...options.pendingReference },
   });
   await app.listen(0, '127.0.0.1');
   const baseUrl = (await app.getUrl()).replace('[::1]', '127.0.0.1');

@@ -6,6 +6,7 @@ import {
   SubmitWagerTransaction,
   type WagerTransactionPayload,
 } from '../../src/application/wagering/submit-wager-transaction';
+import { DEFAULT_PENDING_REFERENCE_POLICY } from '../../src/domain/pending-reference-policy';
 import { WagerTransactionKind } from '../../src/domain/wager-transaction';
 import { BunIdGenerator } from '../../src/infrastructure/id/bun-id-generator';
 import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm-unit-of-work';
@@ -25,7 +26,9 @@ let submit: SubmitWagerTransaction;
 beforeAll(async () => {
   orm = await createTestOrm();
   sql = sqlRunner(orm);
-  submit = new SubmitWagerTransaction(new MikroOrmUnitOfWork(orm, 10_000), new BunIdGenerator(), { now: () => new Date() });
+  submit = new SubmitWagerTransaction(
+    new MikroOrmUnitOfWork(orm, 10_000), new BunIdGenerator(), { now: () => new Date() }, DEFAULT_PENDING_REFERENCE_POLICY,
+  );
 });
 
 afterAll(async () => {

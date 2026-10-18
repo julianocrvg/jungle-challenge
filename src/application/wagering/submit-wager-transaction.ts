@@ -1,9 +1,9 @@
-import { backoffDelayMs } from '../../domain/backoff';
 import { DomainError } from '../../domain/errors';
 import type { EventContext } from '../../domain/events/integration-event';
 import { InboxMessage } from '../../domain/inbox-message';
 import { Money, type MoneyProps } from '../../domain/money';
 import { OutboxMessage } from '../../domain/outbox-message';
+import { nextReferenceAttemptAt, type PendingReferencePolicy } from '../../domain/pending-reference-policy';
 import { WagerTransaction, type WagerTransactionKind } from '../../domain/wager-transaction';
 import {
   IdempotencyKeyConflictError, InboxMessageConflictError, InvalidCommandError, WalletNotFoundError,
@@ -95,6 +95,7 @@ export class SubmitWagerTransaction {
     private readonly unitOfWork: UnitOfWork,
     private readonly ids: IdGenerator,
     private readonly clock: Clock,
+    private readonly pendingPolicy: PendingReferencePolicy,
   ) {}
 
   async execute(command: SubmitWagerTransactionCommand): Promise<SubmissionResult> {
@@ -113,7 +114,8 @@ export class SubmitWagerTransaction {
       if (wallet === undefined) throw new WalletNotFoundError(`Wallet ${tx.walletId} not found`);
       const expectedVersion = wallet.version;
       const outcome = await decideUnderLock(tx, wallet, repositories.transactions, this.ids, now);
-      if (outcome.kind === 'wait') tx.markPendingReference(new Date(now.getTime() + backoffDelayMs(1)));
+      // Primeiro degrau do cronograma: backoff(1), limitado ao prazo (ARCHITECTURE 8.3).
+      if (outcome.kind === 'wait') tx.markPendingReference(nextReferenceAttemptAt(tx.createdAt, 0, now, this.pendingPolicy));
 
       if (!(await repositories.transactions.insertIfAbsent(tx))) {
         // A decisão acima é descartada: nada dela foi gravado. O replay devolve o estado ATUAL da linha

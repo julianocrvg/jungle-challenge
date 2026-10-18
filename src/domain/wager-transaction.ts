@@ -276,6 +276,21 @@ export class WagerTransaction {
   }
 
   /**
+   * Prazo de espera esgotado (ARCHITECTURE 8.3). `reference` é o que a última tentativa encontrou:
+   * - ausente: REFERENCE_NOT_FOUND;
+   * - existente mas ainda não aplicada (PENDING ou PENDING_REFERENCE): REFERENCE_NOT_PROCESSED, com o vínculo.
+   *   É o mesmo código de quando a referência termina REJECTED, então o resultado de uma cadeia não depende
+   *   da ordem em que o worker avalia os elos.
+   */
+  expireReferenceWait(reference: WagerTransaction | undefined, balanceAfter: Money, at: Date): void {
+    if (this._status !== WagerTransactionStatus.PendingReference) {
+      throw new InvalidTransactionStateError(`Cannot expire a reference wait from ${this._status}`);
+    }
+    if (reference === undefined) this.reject(FailureCode.ReferenceNotFound, balanceAfter, at);
+    else this.reject(FailureCode.ReferenceNotProcessed, balanceAfter, at, reference.id);
+  }
+
+  /**
    * Rejeição por regra de negócio: não mexe em saldo, mas guarda o saldo observado para o replay.
    * O saldo está na moeda da wallet, que difere da transação em CURRENCY_MISMATCH (ARCHITECTURE 5.8).
    * Uma reversão rejeitada depois de encontrar a referência guarda o vínculo, para auditoria (ARCHITECTURE 5.10).

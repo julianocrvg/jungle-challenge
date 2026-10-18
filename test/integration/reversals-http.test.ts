@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { ResolvePendingReference } from '../../src/application/wagering/resolve-pending-reference';
+import { DEFAULT_PENDING_REFERENCE_POLICY } from '../../src/domain/pending-reference-policy';
 import { createTestOrm, type Sql, sqlRunner, walletsDivergingFromLedger } from './support/database';
+import { ManualClock } from './support/outbox';
 import {
   createWalletViaApi,
   type HttpResult,
@@ -16,14 +18,25 @@ let api: TestApp;
 let sql: Sql;
 let resolver: ResolvePendingReference;
 let closeOrm: () => Promise<void>;
+const clock = new ManualClock(new Date());
 
 beforeAll(async () => {
   const orm = await createTestOrm();
   sql = sqlRunner(orm);
   closeOrm = () => orm.close(true);
-  api = await startTestApp();
+  api = await startTestApp({ clock });
   resolver = api.app.get(ResolvePendingReference);
 });
+
+/**
+ * O resolve só age em pendentes vencidas (`next_attempt_at <= now`). Avança o relógio um degrau máximo do
+ * backoff (5 min) e resolve, como faria o worker no próximo ciclo. Cada transação criada depois de um avanço
+ * herda o relógio atual, então nenhuma chega perto do prazo de 1 h.
+ */
+async function resolveWhenDue(id: string) {
+  clock.advance(DEFAULT_PENDING_REFERENCE_POLICY.backoff.maxMs);
+  return resolver.execute(id);
+}
 
 afterAll(async () => {
   await api?.close();
@@ -196,7 +209,7 @@ describe('reversal rejections: 422, persisted, no ledger entry, balance untouche
     const w = await createWalletViaApi(api, '100.00');
     const r = await reverse(w, 'ROLLBACK', `opening:${w.id}`, '100.00');
     expect(r.result.status).toBe(202);
-    expect((await resolver.execute(r.id)).outcome).toBe('still_pending');
+    expect((await resolveWhenDue(r.id)).outcome).toBe('still_pending');
     expect(await balanceOf(w.id)).toBe('100.00');
   });
 
@@ -296,14 +309,18 @@ describe('reversal before its reference (PENDING_REFERENCE)', () => {
     expect(pendingReplay.status).toBe(202);
     expect(pendingReplay.body).toEqual({ ...r.result.body, idempotentReplay: true });
 
-    expect((await resolver.execute(r.id)).outcome).toBe('still_pending');
+    // Antes do vencimento, o resolve não conta tentativa nenhuma.
+    expect(await resolver.execute(r.id)).toMatchObject({ outcome: 'noop', reason: 'not_due' });
+    expect(await txRow(r.id)).toMatchObject({ attempts: 0 });
+
+    expect((await resolveWhenDue(r.id)).outcome).toBe('still_pending');
     expect(await txRow(r.id)).toMatchObject({ status: 'PENDING_REFERENCE', attempts: 1, scheduled: true });
     expect(await eventsOf(r.id)).toEqual(['WagerTransactionPendingReference']);
 
     const b = await bet(w, '30.00', { externalTransactionId: betExternalId });
     expect(b.result.body).toMatchObject({ status: 'PROCESSED', balance: brl('70.00') });
 
-    const resolved = await resolver.execute(r.id);
+    const resolved = await resolveWhenDue(r.id);
     expect(resolved.outcome).toBe('resolved');
     expect(await txRow(r.id)).toMatchObject({
       status: 'PROCESSED', balance_after: '100.00', reference_transaction_id: b.id, scheduled: false,
@@ -318,7 +335,7 @@ describe('reversal before its reference (PENDING_REFERENCE)', () => {
     expect(finalReplay.status).toBe(200);
     expect(finalReplay.body).toMatchObject({ status: 'PROCESSED', balance: brl('100.00'), idempotentReplay: true });
 
-    expect((await resolver.execute(r.id)).outcome).toBe('noop');
+    expect(await resolveWhenDue(r.id)).toMatchObject({ outcome: 'noop', reason: 'not_pending' });
   });
 
   test('a reference that is itself PENDING_REFERENCE counts as absent', async () => {
@@ -333,7 +350,7 @@ describe('reversal before its reference (PENDING_REFERENCE)', () => {
     const betExternalId = `ext-${Bun.randomUUIDv7()}`;
     const r = await reverse(w, 'REFUND', betExternalId, '50.00');
     await bet(w, '50.00', { externalTransactionId: betExternalId });
-    const resolved = await resolver.execute(r.id);
+    const resolved = await resolveWhenDue(r.id);
     expect(resolved.outcome).toBe('resolved');
     expect(await txRow(r.id)).toMatchObject({ status: 'REJECTED', failure_code: 'REFERENCE_NOT_PROCESSED' });
     expect(await eventsOf(r.id)).toEqual(['WagerTransactionPendingReference', 'WagerTransactionRejected']);
@@ -349,8 +366,8 @@ describe('reversal before its reference (PENDING_REFERENCE)', () => {
   test('resolving a transaction that is not pending, or does not exist, is a no-op', async () => {
     const w = await createWalletViaApi(api, '100.00');
     const b = await bet(w, '10.00');
-    expect((await resolver.execute(b.id)).outcome).toBe('noop');
-    expect((await resolver.execute(Bun.randomUUIDv7())).outcome).toBe('noop');
+    expect(await resolver.execute(b.id)).toMatchObject({ outcome: 'noop', reason: 'not_pending' });
+    expect(await resolver.execute(Bun.randomUUIDv7())).toMatchObject({ outcome: 'noop', reason: 'not_found' });
   });
 });
 

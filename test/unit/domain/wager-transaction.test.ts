@@ -207,6 +207,30 @@ describe('state transitions', () => {
       expect(tx.isTerminal()).toBe(true);
       expect(tx.nextAttemptAt).toBeUndefined();
     });
+
+    test('expired with no reference found: REFERENCE_NOT_FOUND, no link, the observed balance kept', () => {
+      const tx = pending();
+      tx.expireReferenceWait(undefined, brl('42.00'), LATER);
+      expect(tx.status).toBe(Status.Rejected);
+      expect(tx.failureCode).toBe(FailureCode.ReferenceNotFound);
+      expect(tx.referenceTransactionId).toBeUndefined();
+      expect(tx.balanceAfter?.toJSON().amount).toBe('42.00');
+      expect(tx.processedAt).toEqual(LATER);
+    });
+
+    test('expired with a known reference that never applied: REFERENCE_NOT_PROCESSED, linked to it', () => {
+      const reference = reversalOf(processedTx());
+      reference.markPendingReference(LATER);
+      const tx = pending();
+      tx.expireReferenceWait(reference, brl('42.00'), LATER);
+      expect(tx.failureCode).toBe(FailureCode.ReferenceNotProcessed);
+      expect(tx.referenceTransactionId).toBe(reference.id);
+    });
+
+    test('only a PENDING_REFERENCE transaction can expire', () => {
+      expect(() => newTx().expireReferenceWait(undefined, brl('1.00'), LATER)).toThrow(InvalidTransactionStateError);
+      expect(() => processedTx().expireReferenceWait(undefined, brl('1.00'), LATER)).toThrow(InvalidTransactionStateError);
+    });
   });
 
   describe('terminal states never transition again', () => {

@@ -155,6 +155,27 @@ class SqlWagerTransactionRepository implements WagerTransactionRepository {
     }
   }
 
+  async listDuePendingReferences(now: Date, limit: number): Promise<string[]> {
+    // Sem lock: dois workers podem listar a mesma linha, e quem decide é a releitura sob o lock da wallet
+    // (ARCHITECTURE 8.1). A busca usa o índice parcial wt_pending_reference_due_idx.
+    const rows = await this.em.execute<Row[]>(
+      `SELECT id FROM wager_transactions
+       WHERE status = 'PENDING_REFERENCE' AND next_attempt_at <= ?
+       ORDER BY next_attempt_at, id
+       LIMIT ?`,
+      [now, limit],
+    );
+    return rows.map((row) => str(row, 'id'));
+  }
+
+  async pendingReferenceStats(): Promise<{ pending: number; oldestCreatedAt: Date | undefined }> {
+    const [row] = await this.em.execute<Row[]>(
+      `SELECT count(*)::int AS pending, min(created_at) AS oldest
+       FROM wager_transactions WHERE status = 'PENDING_REFERENCE'`,
+    );
+    return { pending: (row?.pending as number) ?? 0, oldestCreatedAt: row === undefined ? undefined : optionalDate(row, 'oldest') };
+  }
+
   private async findOne(where: string, params: unknown[]): Promise<WagerTransaction | undefined> {
     // O saldo observado está na moeda da wallet (ARCHITECTURE 5.8), por isso o JOIN.
     const [row] = await this.em.execute<Row[]>(

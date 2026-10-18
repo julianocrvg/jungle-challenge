@@ -4,6 +4,7 @@ import type { MikroORM } from '@mikro-orm/postgresql';
 import { TransientInfrastructureError } from '../../src/application/errors';
 import { ResolvePendingReference } from '../../src/application/wagering/resolve-pending-reference';
 import type { SubmitWagerTransaction } from '../../src/application/wagering/submit-wager-transaction';
+import { DEFAULT_PENDING_REFERENCE_POLICY } from '../../src/domain/pending-reference-policy';
 import { BunIdGenerator } from '../../src/infrastructure/id/bun-id-generator';
 import { createSqsClient } from '../../src/infrastructure/messaging/sqs-event-publisher';
 import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm-unit-of-work';
@@ -260,8 +261,12 @@ describe('SQS consumer', () => {
     expect(metrics.counter('sqs_consumer_messages_total', { outcome: 'PENDING_REFERENCE' })).toBe(1);
 
     const [pending] = await sql(`SELECT id FROM wager_transactions WHERE kind = 'REFUND' AND wallet_id = ?`, [wallet.walletId]);
-    // O worker agendado é da fatia 8; aqui o use case dele é chamado direto.
-    const resolver = new ResolvePendingReference(new MikroOrmUnitOfWork(orm, 10_000), new BunIdGenerator(), { now: () => new Date() });
+    // O use case do worker é chamado direto, com um relógio adiantado em um degrau máximo do backoff: a pendente
+    // já venceu e o prazo de 1 h ainda não.
+    const ahead = { now: () => new Date(Date.now() + DEFAULT_PENDING_REFERENCE_POLICY.backoff.maxMs) };
+    const resolver = new ResolvePendingReference(
+      new MikroOrmUnitOfWork(orm, 10_000), new BunIdGenerator(), ahead, DEFAULT_PENDING_REFERENCE_POLICY,
+    );
     const resolved = await resolver.execute(pending?.id as string);
     expect(resolved.transaction?.status).toBe('PROCESSED' as never);
     expect(await ledgerEntries(wallet.walletId)).toBe(2);

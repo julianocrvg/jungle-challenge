@@ -55,7 +55,9 @@ Decisões em ARCHITECTURE.md, seção 7. Os dois lembretes antigos desta fatia (
 - [x] Testes: 10 entregas, messageId novo (replay), HTTP → SQS, venenosas, lock timeout, limite de tentativas com seguidora, REFUND antes da BET, shutdown, crash entre commit e ack
 - [x] Teste de estresse multi-processo (3 consumidores, grupo por mensagem) e mesmo messageId concorrente
 
-## Fatia 9 (observações herdadas da fatia 6)
+## Fatia 9 (observações herdadas das fatias 6 a 8)
+- [ ] Auditar todos os pontos de log (filtro de exceções HTTP, publisher da outbox, worker de pendentes): nunca registrar `error.message` nem `stack` com texto livre. Só nome do erro, SQLSTATE, nome da constraint e frames do stack (o mesmo critério do consumidor SQS, commit 33a7b9d)
+- [ ] Estender o `afterEach` de "nenhum valor monetário em log" aos testes de HTTP, do publisher e do worker de pendentes
 - [ ] `PublishOutboxBatch`: os contadores (`outbox_published_total` e retries) são incrementados antes do commit do lote; se o commit falhar, a métrica conta envios que serão refeitos. Mover para depois do commit
 - [ ] Índice parcial `(occurred_at) WHERE published_at IS NULL` para o `min(occurred_at)` da métrica de outbox lag, que hoje percorre todas as pendentes
 - [ ] ARCHITECTURE: retenção das linhas publicadas da outbox e da inbox (limpeza periódica); relógio (o `Clock` de cada instância grava `next_attempt_at`, e uma instância com relógio adiantado antecipa retries); evento envenenado (erro do remetente fica em retry para sempre, só com alerta)

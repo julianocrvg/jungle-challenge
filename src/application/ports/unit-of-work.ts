@@ -31,6 +31,13 @@ export interface WagerTransactionRepository {
    * sob o lock da wallet; lança se o número de linhas afetadas não for 1 (bug: a linha já foi relida sob o lock).
    */
   updatePendingReference(tx: WagerTransaction): Promise<void>;
+  /**
+   * Ids das PENDING_REFERENCE com `next_attempt_at <= now`, as mais antigas primeiro. SEM lock (nem FOR UPDATE
+   * nem SKIP LOCKED): travar a transação antes da wallet inverteria a ordem de locks (ARCHITECTURE 5.11 e 8.1).
+   */
+  listDuePendingReferences(now: Date, limit: number): Promise<string[]>;
+  /** Quantas estão em PENDING_REFERENCE e o `created_at` da mais antiga (métricas do worker). */
+  pendingReferenceStats(): Promise<{ pending: number; oldestCreatedAt: Date | undefined }>;
 }
 
 export interface LedgerRepository {

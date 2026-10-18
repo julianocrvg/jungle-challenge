@@ -9,6 +9,7 @@ import {
 import type { MikroORM } from '@mikro-orm/postgresql';
 import type { MessageQueue } from '../../../src/application/ports/message-queue';
 import { SubmitWagerTransaction } from '../../../src/application/wagering/submit-wager-transaction';
+import { DEFAULT_PENDING_REFERENCE_POLICY } from '../../../src/domain/pending-reference-policy';
 import { BunIdGenerator } from '../../../src/infrastructure/id/bun-id-generator';
 import { SqsMessageQueue } from '../../../src/infrastructure/messaging/sqs-message-queue';
 import { InMemoryMetrics } from '../../../src/infrastructure/metrics/in-memory-metrics';
@@ -221,6 +222,7 @@ export function buildConsumer(setup: ConsumerSetup): {
   const logger = new CapturingStructuredLogger();
   const real = new SubmitWagerTransaction(
     new MikroOrmUnitOfWork(setup.orm, setup.lockTimeoutMs ?? 10_000), new BunIdGenerator(), { now: () => new Date() },
+    DEFAULT_PENDING_REFERENCE_POLICY,
   );
   const submit = setup.wrapSubmit?.(real) ?? real;
   const sqsQueue = new SqsMessageQueue(setup.client, setup.queues.queueUrl, setup.queues.dlqUrl);
