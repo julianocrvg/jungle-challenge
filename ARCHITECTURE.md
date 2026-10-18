@@ -504,3 +504,14 @@ Testes: `health-http.test.ts` (tudo ok; com o consumidor ligado, também as fila
 **Exceção na varredura de logs.** De um filho morto à força, a última linha de stdout e de stderr pode ter sido cortada no meio da escrita e é ignorada. Todo o resto do que ele escreveu passa pela mesma varredura.
 
 **Porta ocupada.** A porta livre é escolhida antes do spawn, e outro processo pode tomá-la nesse intervalo. Se o filho morre com `EADDRINUSE` antes de ficar pronto, o helper tenta de novo com outra porta (até 3 vezes).
+
+## 11. Observabilidade e autenticação
+
+### 11.1 Autenticação: `AuthGuard` no-op como ponto de extensão
+Autenticação não faz parte do escopo (CLAUDE.md), mas o ponto de extensão é explícito: `AuthGuard` (`src/interface/http/auth.guard.ts`) é aplicado com `@UseGuards` **no nível da classe** em todo controller de negócio (`WalletsController`, `WageringTransactionsController`, `ProviderTransactionsController`), o que cobre `POST /wallets` e `POST /wagering/transactions`. Hoje ele devolve `true`. Trocar a implementação protege todas as rotas de uma vez, sem tocar nos controllers.
+
+**Garantia por teste.** `auth-guard-coverage.test.ts` descobre os controllers no `ModulesContainer` do Nest (não há lista manual) e falha se algum, fora da allowlist explícita `HealthController` e `MetricsController`, não tiver o guard. Um controller novo esquecido quebra o teste.
+
+**Desenho de produção (não implementado).** IdP externo (Keycloak ou Zitadel) com OIDC: o guard valida o JWT (assinatura via JWKS, `iss`, `aud`, `exp`) e deriva o `providerId` do token (claim dedicada), de modo que o provedor deixa de ser informado no corpo e um token não escreve em nome de outro provedor. Papéis no token separam o provedor (submissão e consulta das próprias transações) de um papel operacional (reconciliação, 9.4, que é cara). No consumidor SQS a autorização é a da fila (IAM), não o JWT.
+
+**`/health/*` e `/metrics` ficam abertos**, para orquestrador e scraper funcionarem sem credencial. `/metrics` expõe volumes e nomes de rotas e **não deve ser exposto publicamente**: em produção fica numa rede interna ou atrás de um listener/porta separado, ou do ingress com allowlist de origem.
