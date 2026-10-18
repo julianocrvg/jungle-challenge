@@ -44,7 +44,7 @@ Decisões em ARCHITECTURE.md, seção 6 (e 5.5 para o pool).
 - [x] Correção: conexão derrubada pelo servidor vazava a vaga do pool (Kysely); timestamps das consultas cruas viravam string
 - [x] Testes: next_attempt_at do Clock, atributos da mensagem, SQS fora do ar, timeout, idle timeout (controle e envio lento), reinício, shutdown, 3 publishers, crash com `Bun.spawn`, recuperação do pool
 
-## Fatia 7: consumidor SQS de wager-transactions.fifo (em andamento)
+## Fatia 7: consumidor SQS de wager-transactions.fifo (concluída)
 
 Decisões em ARCHITECTURE.md, seção 7. Os dois lembretes antigos desta fatia (ordem por `walletVersion` e inbox por `eventId`) valem para quem consome `wager-events.fifo` e viraram contrato em ARCHITECTURE 6.4.
 
@@ -53,7 +53,7 @@ Decisões em ARCHITECTURE.md, seção 7. Os dois lembretes antigos desta fatia (
 - [x] Adaptador SQS, worker (long polling, grupos, DLQ explícita, backoff, shutdown), configuração e métricas
 - [x] Redrive de `wager-transactions.fifo` em 15 (3 × 5), conferido no boot
 - [x] Testes: 10 entregas, messageId novo (replay), HTTP → SQS, venenosas, lock timeout, limite de tentativas com seguidora, REFUND antes da BET, shutdown, crash entre commit e ack
-- [ ] Teste de estresse multi-processo (3 consumidores, grupo por mensagem) e mesmo messageId concorrente
+- [x] Teste de estresse multi-processo (3 consumidores, grupo por mensagem) e mesmo messageId concorrente
 
 ## Fatia 9 (observações herdadas da fatia 6)
 - [ ] `PublishOutboxBatch`: os contadores (`outbox_published_total` e retries) são incrementados antes do commit do lote; se o commit falhar, a métrica conta envios que serão refeitos. Mover para depois do commit
