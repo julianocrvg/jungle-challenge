@@ -44,9 +44,19 @@ Decisões em ARCHITECTURE.md, seção 6 (e 5.5 para o pool).
 - [x] Correção: conexão derrubada pelo servidor vazava a vaga do pool (Kysely); timestamps das consultas cruas viravam string
 - [x] Testes: next_attempt_at do Clock, atributos da mensagem, SQS fora do ar, timeout, idle timeout (controle e envio lento), reinício, shutdown, 3 publishers, crash com `Bun.spawn`, recuperação do pool
 
-## Fatia 7 (lembretes para o consumidor)
-- [ ] O consumidor dos eventos ordena por `walletVersion`, não pela ordem de chegada (ARCHITECTURE 6.4)
-- [ ] Idempotência por `eventId` na inbox: depois da janela de 5 min do FIFO, um reenvio da outbox chega duplicado
+## Fatia 7: consumidor SQS de wager-transactions.fifo (em andamento)
+
+Decisões em ARCHITECTURE.md, seção 7. Os dois lembretes antigos desta fatia (ordem por `walletVersion` e inbox por `eventId`) valem para quem consome `wager-events.fifo` e viraram contrato em ARCHITECTURE 6.4.
+
+- [x] Inbox no use case: `ON CONFLICT ON CONSTRAINT inbox_pk DO NOTHING` antes do lock; hash da inbox = key + negócio; `INBOX_MESSAGE_CONFLICT`
+- [x] Parsing do envelope com o validador do HTTP; classificação permanente × transitória × inesperada
+- [ ] Adaptador SQS, worker (long polling, grupos, DLQ explícita, backoff, shutdown), configuração e métricas
+- [ ] Testes de integração do consumidor e teste multi-processo
+
+## Fatia 9 (observações herdadas da fatia 6)
+- [ ] `PublishOutboxBatch`: os contadores (`outbox_published_total` e retries) são incrementados antes do commit do lote; se o commit falhar, a métrica conta envios que serão refeitos. Mover para depois do commit
+- [ ] Índice parcial `(occurred_at) WHERE published_at IS NULL` para o `min(occurred_at)` da métrica de outbox lag, que hoje percorre todas as pendentes
+- [ ] ARCHITECTURE: retenção das linhas publicadas da outbox e da inbox (limpeza periódica); relógio (o `Clock` de cada instância grava `next_attempt_at`, e uma instância com relógio adiantado antecipa retries); evento envenenado (erro do remetente fica em retry para sempre, só com alerta)
 
 ## Fatia 8 (lembrete para o worker)
 - [ ] Respeitar a ordem de locks de 5.11: nunca travar `wager_transactions` antes da wallet

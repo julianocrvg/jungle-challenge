@@ -269,6 +269,10 @@ O retry não tem limite de tentativas. O backoff vem do domínio (4.6), `1 s · 
 
 Não é viável impedir isso sem serializar a publicação por wallet, o que seria um lock global por agregado. Por isso **o consumidor ordena pelo `walletVersion` do `WalletBalanceChanged`**, e não pela ordem de chegada. O claim usa `ORDER BY next_attempt_at, id`, que segue o índice parcial e, na ausência de retries, a ordem de criação (UUIDv7).
 
+**Contrato para quem consome `wager-events.fifo`** (este serviço não consome essa fila; o consumidor da seção 7 é o de `wager-transactions.fifo`):
+- deduplicar por `eventId` numa inbox persistente: depois da janela de 5 min do FIFO, um reenvio da outbox chega duplicado (6.3);
+- ordenar o estado da wallet pelo `walletVersion` do `WalletBalanceChanged` e descartar versões menores ou iguais à já aplicada, nunca pela ordem de chegada.
+
 ### 6.5 Laço e shutdown
 Cada instância roda um `OutboxPublisherWorker` (desligável com `OUTBOX_PUBLISHER_ENABLED=false`). Se o lote veio cheio, o próximo tick roda na hora; se veio incompleto, espera `OUTBOX_POLL_INTERVAL_MS` (default 500 ms), num sono interrompível. Um tick que falha (banco fora do ar) é desfeito, gera log e incrementa `outbox_tick_errors_total`, e o laço continua.
 
@@ -280,3 +284,41 @@ Cada instância roda um `OutboxPublisherWorker` (desligável com `OUTBOX_PUBLISH
 `outbox_lag_seconds` = `now − min(occurred_at)` dos eventos pendentes, incluindo os que esperam retry (zero quando não há nenhum). É medido ao fim de cada tick. Vai para a porta `Metrics`, por enquanto num registro em memória por instância; a exposição em `/metrics` fica para a fatia 9.
 
 Contadores: `outbox_published_total`, `outbox_retries_total{fault}`, `outbox_sender_faults_total{code}`, `outbox_publish_call_failures_total{reason}` e `outbox_tick_errors_total`.
+
+## 7. Consumidor SQS de `wager-transactions.fifo`
+
+### 7.1 Mensagem e `payloadHash`
+O envelope é o do enunciado: `{messageId, type, occurredAt, data}`, validado de forma estrita (campo desconhecido no envelope é recusado, como no corpo HTTP). `type` precisa ser `WagerTransactionRequested`. `data` passa pelo **mesmo** validador do HTTP (`parseWagerTransactionPayload`), então `OPENING`, o provider `internal`, campos desconhecidos e `amount` fora do formato são recusados do mesmo jeito.
+
+`data.idempotencyKey` é o equivalente do header `Idempotency-Key`: sai de `data` antes da validação, passa pelas mesmas regras do header e, se ausente, assume `{providerId}:{externalTransactionId}`. O `payloadHash` da transação é o `hashWagerPayload` do HTTP, sobre a mesma lista explícita de campos de negócio: `messageId`, `type`, `occurredAt` e a key ficam de fora. Por isso a mesma transação enviada pelo HTTP e depois pela fila é **replay**, e não conflito (teste unitário compara os dois hashes; teste de integração faz o caminho completo).
+
+`correlationId` é o `messageId` do envelope e `causationId` é o `MessageId` do SQS.
+
+### 7.2 Inbox na transação da submissão
+O comando do use case ganha um campo opcional `inbox: {consumerName, messageId}`. Com ele, o **primeiro** passo da transação SQL (antes do lock da wallet, ordem de 5.1) é:
+
+`INSERT INTO inbox ... ON CONFLICT ON CONSTRAINT inbox_pk DO NOTHING RETURNING`
+
+- **Inseriu:** segue o fluxo normal. `processed_at` é gravado no próprio INSERT, porque recebimento e efeito financeiro entram no mesmo commit; não existe linha "recebida e não processada".
+- **Não inseriu, mesmo hash:** entrega repetida. Como a inbox só é commitada junto com a transação (nova ou replay), a transação existe: é carregada pela key e devolvida com `duplicateDelivery: true`, **sem travar a wallet** e sem gravar nada.
+- **Não inseriu, hash diferente:** `INBOX_MESSAGE_CONFLICT`, erro permanente (DLQ). Um `messageId` reaproveitado com outro conteúdo não é redelivery: ou é bug do produtor, ou colisão de ids. Processá-lo seria aceitar uma mensagem que a inbox diz já ter visto; descartá-lo com ack apagaria o rastro. A DLQ preserva a mensagem para análise.
+
+**Hash da inbox ≠ `payloadHash`.** A inbox guarda o SHA-256 do JSON canônico de `{idempotencyKey, payload: campos de negócio}`. A key entra porque duas mensagens com o mesmo `messageId` e keys diferentes também são conteúdo diferente, ainda que o negócio seja idêntico. O `payloadHash` da transação continua sem a key (5.3), para casar com o HTTP.
+
+**Atomicidade.** Qualquer erro depois do INSERT da inbox (`WALLET_NOT_FOUND`, conflito de key, falha transitória) desfaz a transação inteira, inclusive a inbox: uma nova entrega é avaliada do zero. É o que permite a falha transitória ser reprocessada.
+
+**Entregas concorrentes da mesma mensagem** (por exemplo, visibilidade expirada enquanto a primeira ainda processa): a segunda espera no índice da PK até a primeira terminar. Se a primeira commitou, a segunda vê o conflito e é duplicata; se desfez, a segunda insere. O `ON CONFLICT` absorve o caso, sem 23505 (teste de estresse em 7.8).
+
+**Dois níveis de duplicata**, ambos na métrica `sqs_consumer_duplicates_total{level}`:
+- `level=inbox`: o mesmo `messageId` de novo (redelivery do SQS, reenvio do produtor);
+- `level=idempotency`: `messageId` novo para a mesma transação de negócio (mesma key e mesmo `payloadHash`), ou a mesma transação já submetida pelo HTTP. A inbox ganha a linha nova e o use case devolve o replay.
+
+### 7.3 Classificação das falhas
+| Resultado | Ação |
+|---|---|
+| PROCESSED, REJECTED, PENDING_REFERENCE, replay, duplicata | ack (`DeleteMessage`) **depois** do commit |
+| JSON inválido, envelope inválido, tipo desconhecido, `data` inválido (inclui OPENING e `internal`), `WALLET_NOT_FOUND`, `IDEMPOTENCY_KEY_CONFLICT`, `EXTERNAL_TRANSACTION_ID_CONFLICT`, `INBOX_MESSAGE_CONFLICT` | **permanente**: DLQ explícita com motivo, depois ack |
+| `TransientInfrastructureError` (conexão, `40P01`, `40001`, `55P03`, ...) | **transitório**: sem ack, `ChangeMessageVisibility` com backoff |
+| Erro inesperado (bug) | transitório com backoff curto e log `error` com stack (sem payload) |
+
+REJECTED é erro de **negócio**: é um resultado persistido e idempotente, e recebe ack como qualquer outro. O erro permanente vai **direto** para a DLQ em vez de esperar o redrive: no FIFO, uma mensagem não apagada bloqueia o grupo (a wallet) até sair, e uma mensagem que nunca vai dar certo bloquearia as seguintes da mesma wallet por `maxReceiveCount × visibilidade`. O erro inesperado é tratado como transitório porque não sabemos se ele se repete: descartar uma mensagem válida por causa de um bug passageiro seria pior do que tentar de novo algumas vezes.

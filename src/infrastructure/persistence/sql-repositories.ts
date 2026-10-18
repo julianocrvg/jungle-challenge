@@ -1,12 +1,14 @@
 import type { EntityManager } from '@mikro-orm/postgresql';
 import { ExternalTransactionIdConflictError } from '../../application/errors';
 import type {
+  InboxRepository,
   LedgerRepository,
   OutboxRepository,
   TransactionalRepositories,
   WagerTransactionRepository,
   WalletRepository,
 } from '../../application/ports/unit-of-work';
+import { InboxMessage } from '../../domain/inbox-message';
 import { Money } from '../../domain/money';
 import { OutboxMessage } from '../../domain/outbox-message';
 import {
@@ -272,6 +274,39 @@ class SqlOutboxRepository implements OutboxRepository {
   }
 }
 
+class SqlInboxRepository implements InboxRepository {
+  constructor(private readonly em: EntityManager) {}
+
+  async insertIfAbsent(message: InboxMessage): Promise<boolean> {
+    // Alvo explícito: só a PK da inbox significa "já recebida". Sem alvo, o DO NOTHING esconderia qualquer
+    // outra violação (ARCHITECTURE 5.4). Uma entrega concorrente espera o commit da primeira e cai aqui.
+    const rows = await this.em.execute<Row[]>(
+      `INSERT INTO inbox (consumer_name, message_id, payload_hash, received_at, processed_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT ON CONSTRAINT inbox_pk DO NOTHING
+       RETURNING message_id`,
+      [message.consumerName, message.messageId, message.payloadHash, message.receivedAt, message.processedAt ?? null],
+    );
+    return rows.length === 1;
+  }
+
+  async find(consumerName: string, messageId: string): Promise<InboxMessage | undefined> {
+    const [row] = await this.em.execute<Row[]>(
+      `SELECT consumer_name, message_id, payload_hash, received_at, processed_at
+       FROM inbox WHERE consumer_name = ? AND message_id = ?`,
+      [consumerName, messageId],
+    );
+    if (row === undefined) return undefined;
+    return InboxMessage.rehydrate({
+      consumerName: str(row, 'consumer_name'),
+      messageId: str(row, 'message_id'),
+      payloadHash: str(row, 'payload_hash'),
+      receivedAt: date(row, 'received_at'),
+      processedAt: optionalDate(row, 'processed_at'),
+    });
+  }
+}
+
 /** Repositórios ligados ao EntityManager da transação corrente. */
 export function sqlRepositories(em: EntityManager): TransactionalRepositories {
   return {
@@ -279,5 +314,6 @@ export function sqlRepositories(em: EntityManager): TransactionalRepositories {
     transactions: new SqlWagerTransactionRepository(em),
     ledger: new SqlLedgerRepository(em),
     outbox: new SqlOutboxRepository(em),
+    inbox: new SqlInboxRepository(em),
   };
 }

@@ -31,6 +31,11 @@ export class InboxMessage {
     return this._processedAt;
   }
 
+  /** Mesmo messageId com outro conteúdo não é redelivery: é conflito (ARCHITECTURE 7.2). */
+  matchesPayload(payloadHash: string): boolean {
+    return this.payloadHash === payloadHash;
+  }
+
   isProcessed(): boolean {
     return this._processedAt !== undefined;
   }

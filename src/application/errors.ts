@@ -34,6 +34,11 @@ export class ExternalTransactionIdConflictError extends ApplicationError {
   readonly code = 'EXTERNAL_TRANSACTION_ID_CONFLICT';
 }
 
+/** Mesmo messageId (no mesmo consumidor) com conteúdo diferente: não é redelivery (ARCHITECTURE 7.2). */
+export class InboxMessageConflictError extends ApplicationError {
+  readonly code = 'INBOX_MESSAGE_CONFLICT';
+}
+
 /** Banco indisponível, timeout de lock, deadlock, falha de serialização: pode ser reenviado com segurança. */
 export class TransientInfrastructureError extends ApplicationError {
   readonly code = 'SERVICE_UNAVAILABLE';
