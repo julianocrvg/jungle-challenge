@@ -46,7 +46,7 @@ describe('GET /wagering/transactions/:transactionId', () => {
     const result = await get<TransactionBody>(`/wagering/transactions/${placed.body.transactionId}`);
     expect(result.status).toBe(200);
     expect(result.body).toEqual({
-      transactionId: placed.body.transactionId, status: 'PROCESSED', failureCode: null,
+      transactionId: placed.body.transactionId!, status: 'PROCESSED', failureCode: null,
       balance: { amount: '75.00', currency: 'BRL' }, idempotentReplay: false,
     });
   });
@@ -59,7 +59,7 @@ describe('GET /wagering/transactions/:transactionId', () => {
     const result = await get<TransactionBody>(`/wagering/transactions/${placed.body.transactionId}`);
     expect(result.status).toBe(200);
     expect(result.body).toEqual({
-      transactionId: placed.body.transactionId, status: 'REJECTED', failureCode: 'INSUFFICIENT_FUNDS',
+      transactionId: placed.body.transactionId!, status: 'REJECTED', failureCode: 'INSUFFICIENT_FUNDS',
       balance: { amount: '10.00', currency: 'BRL' }, idempotentReplay: false,
     });
   });
@@ -74,7 +74,7 @@ describe('GET /wagering/transactions/:transactionId', () => {
     const result = await get<TransactionBody>(`/wagering/transactions/${placed.body.transactionId}`);
     expect(result.status).toBe(200);
     expect(result.body).toEqual({
-      transactionId: placed.body.transactionId, status: 'PENDING_REFERENCE', failureCode: null,
+      transactionId: placed.body.transactionId!, status: 'PENDING_REFERENCE', failureCode: null,
       balance: null, idempotentReplay: false,
     });
   });

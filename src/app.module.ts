@@ -13,6 +13,7 @@ import { SubmitWagerTransaction } from './application/wagering/submit-wager-tran
 import { CreateWallet } from './application/wallets/create-wallet';
 import { GetLedgerPage } from './application/wallets/get-ledger-page';
 import { GetWallet } from './application/wallets/get-wallet';
+import { ReconcileWallet } from './application/wallets/reconcile-wallet';
 import { WALLET_QUERIES, type WalletQueries } from './application/ports/wallet-queries';
 import { SqlWalletQueries } from './infrastructure/persistence/sql-wallet-queries';
 import { MESSAGE_QUEUE, type MessageQueue } from './application/ports/message-queue';
@@ -124,6 +125,12 @@ export class AppModule {
           inject: [MikroORM],
         },
         { provide: GetWallet, useFactory: (q: WalletQueries) => new GetWallet(q), inject: [WALLET_QUERIES] },
+        {
+          provide: ReconcileWallet,
+          useFactory: (q: WalletQueries, metrics: Metrics) =>
+            new ReconcileWallet(q, metrics, new NestStructuredLogger('Reconciliation')),
+          inject: [WALLET_QUERIES, METRICS],
+        },
         {
           provide: GetLedgerPage,
           useFactory: (q: WalletQueries) => new GetLedgerPage(q, ledger),
