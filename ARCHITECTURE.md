@@ -471,3 +471,15 @@ Postgres real; todos terminam com `wallet.balance == saldo reconstruído pelo le
 - `transaction-queries-http.test.ts`: 200 para PROCESSED, REJECTED e PENDING_REFERENCE; 404 `TRANSACTION_NOT_FOUND`; OPENING invisível; `externalTransactionId` e `providerId` com `/`, espaço, `%`, `?`, `#`, `+` e acento.
 - `reconciliation-http.test.ts`: consistente após BET/WIN/REFUND (com OPENING), LOSS, wallet sem lançamentos, 404/400, **divergência provocada por `UPDATE wallets.balance`** (o ledger não pode ser alterado; o teste restaura o saldo num `finally`), diferença negativa, e **reconciliação em paralelo com 90 apostas** sem nenhuma divergência falsa, nenhum log `error` e contador intacto.
 - Nota: no teste de divergência o log `error` contém a `difference` (por exemplo `5.25`), que casaria com o detector de valor monetário do `afterEach`; o teste valida o conteúdo exato do log e depois limpa o logger capturado, em vez de afrouxar o detector para todos os outros testes.
+
+## 10. Health checks e múltiplas instâncias
+
+### 10.1 `/health/live` e `/health/ready`
+Os dois são abertos, sem `AuthGuard` (CLAUDE.md, "Autenticação").
+- **`/health/live`** responde 200 se o processo atende HTTP e **não toca nenhuma dependência**. Se o liveness consultasse o banco, uma queda do Postgres faria o orquestrador reiniciar todas as instâncias ao mesmo tempo, sem nenhum ganho: o problema não está no processo.
+- **`/health/ready`** confere as dependências sem as quais a instância não deve receber tráfego: `SELECT 1` por uma conexão do pool (`postgres`), `GetQueueAttributes` da fila de eventos (`sqs-events`) e, **só se o consumidor estiver ligado**, da fila de transações e da DLQ (`sqs-transactions`, `sqs-transactions-dlq`). Responde 200 `{status:'ok', checks}` ou 503 `{status:'unavailable', checks}`, com `ok`/`down` por check. O 503 tira a instância do balanceamento sem matá-la.
+- **Teto por check** (`READINESS_TIMEOUT_MS`, 2 s), em paralelo, aplicado com `Promise.race` mais `AbortSignal`. O driver do Postgres não aceita sinal, e um banco que aceita a conexão e não responde penduraria o health check (teste com um socket que nunca responde).
+- **Sem texto livre:** a resposta traz só o nome de cada check, e o log `warn` traz só o nome do probe e o nome do erro, nunca a mensagem (mesmo critério de 7.3).
+- Uma falha de readiness não para os workers: eles já tratam a falha de cada ciclo (6.5, 7.4, 8.4) e voltam sozinhos quando a dependência volta.
+
+Testes: `health-http.test.ts` (tudo ok; com o consumidor ligado, também as filas dele; fila inexistente; Postgres com conexão recusada; Postgres que nunca responde, cortado no teto) e `readiness.test.ts` (unidade: teto mesmo com probe que ignora o sinal).

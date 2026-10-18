@@ -49,7 +49,14 @@ import { createSqsClient, SqsEventPublisher } from './infrastructure/messaging/s
 import { InMemoryMetrics } from './infrastructure/metrics/in-memory-metrics';
 import { MikroOrmUnitOfWork } from './infrastructure/persistence/mikro-orm-unit-of-work';
 import { createOrmConfig } from './infrastructure/persistence/mikro-orm.config';
+import type { MikroORM as PostgresMikroORM } from '@mikro-orm/postgresql';
+import {
+  PostgresReadinessProbe,
+  ReadinessProbeSet,
+  SqsQueueReadinessProbe,
+} from './infrastructure/health/readiness-probes';
 import { HealthController } from './interface/http/health.controller';
+import { READINESS_PROBES } from './interface/http/readiness';
 import { ProviderTransactionsController, WageringTransactionsController } from './interface/http/wagering-transactions.controller';
 import { GetWagerTransaction } from './application/wagering/get-wager-transaction';
 import { WalletsController } from './interface/http/wallets.controller';
@@ -189,6 +196,24 @@ export class AppModule {
               pollIntervalMs: outbox.pollIntervalMs,
             }),
           inject: [PublishOutboxBatch, METRICS],
+        },
+        {
+          // A fila de entrada e a DLQ só contam quando o consumidor está ligado nesta instância.
+          provide: READINESS_PROBES,
+          useFactory: (orm: MikroORM): ReadinessProbeSet => {
+            const client = createSqsClient(sqs);
+            return new ReadinessProbeSet([
+              new PostgresReadinessProbe(orm as PostgresMikroORM),
+              new SqsQueueReadinessProbe('sqs-events', client, sqs.eventsQueueUrl),
+              ...(consumer.enabled
+                ? [
+                  new SqsQueueReadinessProbe('sqs-transactions', client, consumer.queueUrl),
+                  new SqsQueueReadinessProbe('sqs-transactions-dlq', client, consumer.deadLetterQueueUrl),
+                ]
+                : []),
+            ], client);
+          },
+          inject: [MikroORM],
         },
         {
           provide: MESSAGE_QUEUE,
