@@ -30,6 +30,24 @@ Decisões em ARCHITECTURE.md, seções 5.10 e 5.11.
 - [x] `ResolvePendingReference`: lê sem lock → trava a wallet → relê → no-op se já não está pendente; UPDATE com guarda de status e conferência de linhas
 - [x] Testes: cada regra, replay, reversão antes da referência, dupla reversão concorrente, resolves concorrentes, REFUND e BET em paralelo
 
+## Fatia 6: publisher da outbox (concluída)
+
+Decisões em ARCHITECTURE.md, seção 6 (e 5.5 para o pool).
+
+- [x] Fila FIFO `wager-events.fifo` com DLQ no LocalStack; `@aws-sdk/client-sqs` com `maxAttempts: 1`
+- [x] Teste de fumaça: o LocalStack deduplica por `MessageDeduplicationId`, então os testes exigem cada `eventId` exatamente uma vez
+- [x] `PublishOutboxBatch`: claim com `SKIP LOCKED` → `SendMessageBatch` com timeout → `published_at` ou retry, numa transação
+- [x] `idle_in_transaction_session_timeout` ≥ `max(3 × envio, 15 s)`, validado na configuração
+- [x] Falha por entrada: erro do remetente (log `error` + contador próprio) × erro do serviço; timeout tratado como ambíguo
+- [x] Worker por instância; o shutdown (`app.close()`/SIGTERM) conclui o lote em andamento
+- [x] Métrica `outbox_lag_seconds` e contadores (porta `Metrics`, em memória até a fatia 9)
+- [x] Correção: conexão derrubada pelo servidor vazava a vaga do pool (Kysely); timestamps das consultas cruas viravam string
+- [x] Testes: next_attempt_at do Clock, atributos da mensagem, SQS fora do ar, timeout, idle timeout (controle e envio lento), reinício, shutdown, 3 publishers, crash com `Bun.spawn`, recuperação do pool
+
+## Fatia 7 (lembretes para o consumidor)
+- [ ] O consumidor dos eventos ordena por `walletVersion`, não pela ordem de chegada (ARCHITECTURE 6.4)
+- [ ] Idempotência por `eventId` na inbox: depois da janela de 5 min do FIFO, um reenvio da outbox chega duplicado
+
 ## Fatia 8 (lembrete para o worker)
 - [ ] Respeitar a ordem de locks de 5.11: nunca travar `wager_transactions` antes da wallet
 - [ ] Limite de tentativas ou TTL → `REJECTED` `REFERENCE_NOT_FOUND` + evento (também encerra ROLLBACK de OPENING e referências de outro provider)
