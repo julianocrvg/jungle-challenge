@@ -156,6 +156,12 @@ Só `wt_provider_external_uq` vira `409 EXTERNAL_TRANSACTION_ID_CONFLICT`: o mes
 ### 5.5 Pool e `lock_timeout`
 O pool tem 20 conexões por padrão (`DB_POOL_MAX`). Cada transação de submissão roda `SET LOCAL lock_timeout` com o valor de `DB_LOCK_TIMEOUT_MS` (default 10000). O valor precisa ser alto o bastante para que uma fila normal de requisições na mesma wallet espere, em vez de falhar: o teste de 50 requisições paralelas na mesma wallet exige zero 503 e zero `40P01`. Estourar o timeout (`55P03`) é contenção anormal e vira `503` com `Retry-After`, que o provedor pode reenviar com segurança pela idempotência. Ele existe para que uma requisição não segure uma conexão do pool indefinidamente atrás de um lock preso.
 
+**Conexão derrubada pelo servidor não pode vazar a vaga do pool (`pool-guard.ts`).** Isto foi encontrado na fatia 6. O Kysely 0.29, usado pelo MikroORM 7, só devolve a conexão ao pool depois que o ROLLBACK dá certo. Se o servidor derruba a sessão no meio da transação (`idle_in_transaction_session_timeout`, restart do Postgres, `pg_terminate_backend`), o ROLLBACK lança erro, o release nunca acontece e a vaga se perde. Com o pool todo perdido, a instância trava, e até o `orm.close()` fica esperando.
+
+A correção usa o hook `onPoolCreated`: quando um cliente emprestado emite `'error'`, chamamos `client.release(error)`, e o pg-pool descarta o cliente. Se o cliente já estava ocioso, o "already released" é ignorado de propósito. O teste `pool-recovery.test.ts` usa `poolMax: 1`: sem a correção, a transação seguinte nunca consegue conexão.
+
+**Timestamps como texto.** O MikroORM registra um parser que devolve `timestamptz` como texto nas consultas cruas. Os repositórios convertem esse texto para `Date` explicitamente (`timestamps.ts`). Antes desta correção, as datas reidratadas eram strings tipadas como `Date`.
+
 ### 5.6 OPENING: valores sintéticos e provider reservado
 A transação interna `OPENING` preenche as colunas NOT NULL com valores sintéticos e determinísticos: `provider_id = 'internal'`, `external_transaction_id = 'opening:{walletId}'`, `idempotency_key = 'internal:opening:{walletId}'` e `payload_hash` = SHA-256 do JSON canônico de `{kind: 'OPENING', walletId, playerId, money}`. `round_id` e `game_id` ficam NULL, como o CHECK `wt_round_game_required` já permite. Em `PROCESSED`, `balance_after` é o próprio saldo inicial.
 

@@ -18,6 +18,7 @@ import {
 import { Wallet } from '../../domain/wallet';
 import type { WalletLedgerEntry } from '../../domain/wallet-ledger-entry';
 import { uniqueViolationConstraint } from './database-errors';
+import { parseOptionalTimestamp, parseTimestamp } from './timestamps';
 
 /*
  * Repositórios em SQL explícito (ARCHITECTURE 1.2): cada lock e cada ON CONFLICT fica visível aqui.
@@ -28,7 +29,8 @@ type Row = Record<string, unknown>;
 
 const str = (row: Row, column: string): string => row[column] as string;
 const optional = (row: Row, column: string): string | undefined => (row[column] ?? undefined) as string | undefined;
-const date = (row: Row, column: string): Date => row[column] as Date;
+const date = (row: Row, column: string): Date => parseTimestamp(row[column]);
+const optionalDate = (row: Row, column: string): Date | undefined => parseOptionalTimestamp(row[column]);
 
 class SqlWalletRepository implements WalletRepository {
   constructor(private readonly em: EntityManager) {}
@@ -184,9 +186,9 @@ class SqlWagerTransactionRepository implements WagerTransactionRepository {
       failureCode: optional(row, 'failure_code') as FailureCode | undefined,
       balanceAfter:
         balanceAfter === undefined ? undefined : Money.from({ amount: balanceAfter, currency: str(row, 'wallet_currency') }),
-      processedAt: (row.processed_at ?? undefined) as Date | undefined,
+      processedAt: optionalDate(row, 'processed_at'),
       attempts: row.attempts as number,
-      nextAttemptAt: (row.next_attempt_at ?? undefined) as Date | undefined,
+      nextAttemptAt: optionalDate(row, 'next_attempt_at'),
     });
   }
 }
@@ -255,7 +257,7 @@ class SqlOutboxRepository implements OutboxRepository {
 
   async oldestPendingOccurredAt(): Promise<Date | undefined> {
     const [row] = await this.em.execute<Row[]>(`SELECT min(occurred_at) AS oldest FROM outbox WHERE published_at IS NULL`);
-    return (row?.oldest ?? undefined) as Date | undefined;
+    return row === undefined ? undefined : optionalDate(row, 'oldest');
   }
 
   // Guarda `published_at IS NULL`: com a linha travada por claimDue, zero linhas aqui é bug, e o lote é desfeito.
