@@ -66,6 +66,8 @@ export async function startTestApp(options: CreateAppOptions = {}): Promise<Test
     database: { url: TEST_DATABASE_URL, ...options.database },
     // Desligado por padrão: os testes de HTTP conferem a outbox e não podem ter um publisher concorrente.
     outbox: { enabled: false, ...options.outbox },
+    // Idem para o consumidor: os testes da fila montam o seu, com filas temporárias.
+    consumer: { enabled: false, ...options.consumer },
   });
   await app.listen(0, '127.0.0.1');
   const baseUrl = (await app.getUrl()).replace('[::1]', '127.0.0.1');

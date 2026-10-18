@@ -96,6 +96,83 @@ export function validateOutboxSettings(settings: OutboxSettings): void {
   }
 }
 
+export interface ConsumerSettings {
+  /** Liga o consumidor de wager-transactions.fifo nesta instância. */
+  enabled: boolean;
+  queueUrl: string;
+  deadLetterQueueUrl: string;
+  /** Tentativas (receives) antes da DLQ para falhas transitórias (ARCHITECTURE 7.4). */
+  maxAttempts: number;
+  /** Long polling: até 20 s, o limite do SQS. */
+  waitTimeSeconds: number;
+  /** Visibilidade pedida no ReceiveMessage. Precisa cobrir lock_timeout + margem (validado). */
+  visibilityTimeoutSeconds: number;
+  /** Mensagens processadas em paralelo por instância, cada uma com uma conexão: abaixo do pool (validado). */
+  concurrency: number;
+  backoffBaseMs: number;
+  backoffMaxMs: number;
+}
+
+export const CONSUMER_NAME = 'wager-transactions';
+export const DEFAULT_CONSUMER_MAX_ATTEMPTS = 5;
+export const DEFAULT_CONSUMER_WAIT_SECONDS = 20;
+export const DEFAULT_CONSUMER_VISIBILITY_TIMEOUT_S = 30;
+export const DEFAULT_CONSUMER_CONCURRENCY = 10;
+/** Margem de processamento além do lock_timeout: SQL da submissão, commit e ack. */
+export const CONSUMER_PROCESSING_MARGIN_MS = 5_000;
+/** Teto do ChangeMessageVisibility no SQS: 12 h. */
+const MAX_VISIBILITY_MS = 12 * 60 * 60 * 1000;
+
+export function consumerSettingsFromEnv(env: Record<string, string | undefined> = process.env): ConsumerSettings {
+  const endpoint = env.SQS_ENDPOINT ?? DEFAULT_SQS_ENDPOINT;
+  return {
+    enabled: env.SQS_CONSUMER_ENABLED !== 'false',
+    queueUrl: env.SQS_TRANSACTIONS_QUEUE_URL ?? `${endpoint}/000000000000/wager-transactions.fifo`,
+    deadLetterQueueUrl: env.SQS_TRANSACTIONS_DLQ_URL ?? `${endpoint}/000000000000/wager-transactions-dlq.fifo`,
+    maxAttempts: positiveInteger(env, 'SQS_CONSUMER_MAX_ATTEMPTS', DEFAULT_CONSUMER_MAX_ATTEMPTS),
+    waitTimeSeconds: positiveInteger(env, 'SQS_CONSUMER_WAIT_SECONDS', DEFAULT_CONSUMER_WAIT_SECONDS),
+    visibilityTimeoutSeconds: positiveInteger(env, 'SQS_CONSUMER_VISIBILITY_TIMEOUT_S', DEFAULT_CONSUMER_VISIBILITY_TIMEOUT_S),
+    concurrency: positiveInteger(env, 'SQS_CONSUMER_CONCURRENCY', DEFAULT_CONSUMER_CONCURRENCY),
+    backoffBaseMs: positiveInteger(env, 'SQS_CONSUMER_BACKOFF_BASE_MS', 1_000),
+    backoffMaxMs: positiveInteger(env, 'SQS_CONSUMER_BACKOFF_MAX_MS', 60_000),
+  };
+}
+
+/** Tempo que uma mensagem pode levar: o maior lock_timeout possível mais a margem (ARCHITECTURE 7.4). */
+export function consumerProcessingBudgetMs(database: Pick<DatabaseSettings, 'lockTimeoutMs'>): number {
+  return database.lockTimeoutMs + CONSUMER_PROCESSING_MARGIN_MS;
+}
+
+/**
+ * - Visibilidade menor que lock_timeout + margem: a mensagem reapareceria para outro consumidor enquanto a
+ *   primeira ainda espera o lock, gerando trabalho duplicado (a inbox deduplica, mas é desperdício e contenção).
+ * - Concorrência: cada mensagem em andamento segura uma conexão. Somada ao publisher da outbox, precisa ficar
+ *   abaixo do pool, para sobrar conexão para o HTTP e para o health check.
+ */
+export function validateConsumerSettings(
+  settings: ConsumerSettings, database: Pick<DatabaseSettings, 'poolMax' | 'lockTimeoutMs'>, outboxEnabled: boolean,
+): void {
+  if (settings.waitTimeSeconds > 20) {
+    throw new Error(`SQS_CONSUMER_WAIT_SECONDS must be at most 20, got ${settings.waitTimeSeconds}`);
+  }
+  if (settings.visibilityTimeoutSeconds * 1000 < consumerProcessingBudgetMs(database)) {
+    throw new Error(
+      `SQS_CONSUMER_VISIBILITY_TIMEOUT_S must cover DB_LOCK_TIMEOUT_MS + ${CONSUMER_PROCESSING_MARGIN_MS} ms, `
+      + `got ${settings.visibilityTimeoutSeconds} s for a lock timeout of ${database.lockTimeoutMs} ms`,
+    );
+  }
+  const reserved = settings.concurrency + (outboxEnabled ? 1 : 0);
+  if (reserved >= database.poolMax) {
+    throw new Error(
+      `SQS_CONSUMER_CONCURRENCY (${settings.concurrency})${outboxEnabled ? ' + outbox publisher (1)' : ''} `
+      + `must be below DB_POOL_MAX (${database.poolMax})`,
+    );
+  }
+  if (settings.backoffMaxMs > MAX_VISIBILITY_MS || settings.backoffBaseMs > settings.backoffMaxMs) {
+    throw new Error('SQS_CONSUMER_BACKOFF_BASE_MS <= SQS_CONSUMER_BACKOFF_MAX_MS <= 12 h is required');
+  }
+}
+
 function positiveInteger(env: Record<string, string | undefined>, name: string, fallback: number): number {
   const raw = env[name];
   if (raw === undefined || raw === '') return fallback;

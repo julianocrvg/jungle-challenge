@@ -10,16 +10,24 @@ import { UNIT_OF_WORK, type UnitOfWork } from './application/ports/unit-of-work'
 import { ResolvePendingReference } from './application/wagering/resolve-pending-reference';
 import { SubmitWagerTransaction } from './application/wagering/submit-wager-transaction';
 import { CreateWallet } from './application/wallets/create-wallet';
+import { MESSAGE_QUEUE, type MessageQueue } from './application/ports/message-queue';
 import {
+  CONSUMER_NAME,
+  type ConsumerSettings,
+  consumerProcessingBudgetMs,
+  consumerSettingsFromEnv,
   type DatabaseSettings,
   databaseSettingsFromEnv,
   type OutboxSettings,
   outboxSettingsFromEnv,
   type SqsSettings,
   sqsSettingsFromEnv,
+  validateConsumerSettings,
   validateOutboxSettings,
 } from './config';
 import { DEFAULT_BACKOFF } from './domain/backoff';
+import { SqsMessageQueue } from './infrastructure/messaging/sqs-message-queue';
+import { WagerTransactionsConsumer } from './interface/workers/wager-transactions-consumer.worker';
 import { SystemClock } from './infrastructure/clock/system-clock';
 import { BunIdGenerator } from './infrastructure/id/bun-id-generator';
 import { NestStructuredLogger } from './infrastructure/logging/nest-structured-logger';
@@ -37,11 +45,17 @@ export interface AppOptions {
   database?: Partial<DatabaseSettings>;
   sqs?: Partial<SqsSettings>;
   outbox?: Partial<OutboxSettings>;
+  consumer?: Partial<ConsumerSettings>;
   idGenerator?: IdGenerator;
   clock?: Clock;
   eventPublisher?: EventPublisher;
   metrics?: Metrics;
 }
+
+/** Erro inesperado no consumidor: retry curto até o limite de tentativas (ARCHITECTURE 7.3). */
+export const UNEXPECTED_ERROR_BACKOFF = { baseMs: 1_000, maxMs: 5_000 };
+/** maxReceiveCount do redrive >= 3 x SQS_CONSUMER_MAX_ATTEMPTS (ARCHITECTURE 7.4). */
+export const REDRIVE_SAFETY_FACTOR = 3;
 
 // Os use cases não conhecem o Nest: são montados aqui por factory, sem decorators na camada de aplicação.
 @Module({})
@@ -51,6 +65,8 @@ export class AppModule {
     const sqs = { ...sqsSettingsFromEnv(), ...options.sqs };
     const outbox = { ...outboxSettingsFromEnv(), ...options.outbox };
     validateOutboxSettings(outbox);
+    const consumer = { ...consumerSettingsFromEnv(), ...options.consumer };
+    if (consumer.enabled) validateConsumerSettings(consumer, database, outbox.enabled);
     const useCaseDeps = [UNIT_OF_WORK, ID_GENERATOR, CLOCK];
     return {
       module: AppModule,
@@ -104,6 +120,28 @@ export class AppModule {
               pollIntervalMs: outbox.pollIntervalMs,
             }),
           inject: [PublishOutboxBatch, METRICS],
+        },
+        {
+          provide: MESSAGE_QUEUE,
+          useFactory: () => new SqsMessageQueue(createSqsClient(sqs), consumer.queueUrl, consumer.deadLetterQueueUrl),
+        },
+        {
+          provide: WagerTransactionsConsumer,
+          useFactory: (submit: SubmitWagerTransaction, queue: MessageQueue, metrics: Metrics) =>
+            new WagerTransactionsConsumer(submit, queue, metrics, new NestStructuredLogger('WagerConsumer'), {
+              enabled: consumer.enabled,
+              consumerName: CONSUMER_NAME,
+              maxAttempts: consumer.maxAttempts,
+              waitTimeSeconds: consumer.waitTimeSeconds,
+              visibilityTimeoutSeconds: consumer.visibilityTimeoutSeconds,
+              concurrency: consumer.concurrency,
+              backoff: { baseMs: consumer.backoffBaseMs, maxMs: consumer.backoffMaxMs },
+              unexpectedBackoff: UNEXPECTED_ERROR_BACKOFF,
+              processingBudgetMs: consumerProcessingBudgetMs(database),
+              receiveErrorDelayMs: 1_000,
+              redriveSafetyFactor: REDRIVE_SAFETY_FACTOR,
+            }),
+          inject: [SubmitWagerTransaction, MESSAGE_QUEUE, METRICS],
         },
       ],
     };

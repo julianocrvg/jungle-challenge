@@ -321,4 +321,44 @@ O comando do use case ganha um campo opcional `inbox: {consumerName, messageId}`
 | `TransientInfrastructureError` (conexão, `40P01`, `40001`, `55P03`, ...) | **transitório**: sem ack, `ChangeMessageVisibility` com backoff |
 | Erro inesperado (bug) | transitório com backoff curto e log `error` com stack (sem payload) |
 
-REJECTED é erro de **negócio**: é um resultado persistido e idempotente, e recebe ack como qualquer outro. O erro permanente vai **direto** para a DLQ em vez de esperar o redrive: no FIFO, uma mensagem não apagada bloqueia o grupo (a wallet) até sair, e uma mensagem que nunca vai dar certo bloquearia as seguintes da mesma wallet por `maxReceiveCount × visibilidade`. O erro inesperado é tratado como transitório porque não sabemos se ele se repete: descartar uma mensagem válida por causa de um bug passageiro seria pior do que tentar de novo algumas vezes.
+REJECTED é erro de **negócio**: é um resultado persistido e idempotente, e recebe ack como qualquer outro. O erro permanente vai **direto** para a DLQ em vez de esperar o redrive: no FIFO, uma mensagem não apagada bloqueia o grupo (a wallet) até sair, e uma mensagem que nunca vai dar certo bloquearia as seguintes da mesma wallet por `maxReceiveCount × visibilidade`. O erro inesperado é tratado como transitório porque não sabemos se ele se repete: descartar uma mensagem válida por causa de um bug passageiro seria pior do que tentar de novo algumas vezes. O backoff dele é curto (1 s a 5 s), e o log `error` leva o stack, sem o corpo da mensagem.
+
+### 7.4 Tentativas, backoff, visibilidade e concorrência
+**Retry pela visibilidade.** Uma falha transitória não recebe ack. O consumidor chama `ChangeMessageVisibility` com `backoff(ApproximateReceiveCount)` (default de 1 s a 60 s, `SQS_CONSUMER_BACKOFF_BASE_MS`/`_MAX_MS`), e a mensagem reaparece depois desse prazo. O estado do retry fica no próprio SQS, sem tabela. A transação desfeita levou a inbox junto (7.2), então a nova entrega é avaliada do zero.
+
+**Limite de tentativas.** Quando `ApproximateReceiveCount >= SQS_CONSUMER_MAX_ATTEMPTS` (default 5) e a falha ainda é transitória, o **consumidor** manda a mensagem para a DLQ com `failureReason=MAX_ATTEMPTS_EXCEEDED` e `failureDetail` = o motivo da última falha (`55P03`, `SERVICE_UNAVAILABLE`, `UNEXPECTED_ERROR`...).
+
+**Redrive como rede de segurança, em pelo menos 3× o limite.** O `ApproximateReceiveCount` conta **toda** entrega, inclusive as devoluções com visibilidade 0 (7.5 e 7.7). Uma mensagem que está atrás de outra em retry no mesmo grupo é recebida e devolvida a cada tentativa da primeira, sem ser processada. Se o `maxReceiveCount` da `RedrivePolicy` fosse igual ao limite do consumidor, o próprio SQS poderia mandar essa seguidora para a DLQ sem que ela tivesse sido tentada nenhuma vez. Por isso:
+- a fila do LocalStack tem `maxReceiveCount` 15 (= 3 × 5; `init-sqs.sh`);
+- o consumidor confere a `RedrivePolicy` no boot e **recusa subir** se `maxReceiveCount < 3 × SQS_CONSUMER_MAX_ATTEMPTS`; sem `RedrivePolicy`, só avisa;
+- o redrive do SQS só age se o processo morrer em loop numa mensagem (crash antes de qualquer decisão). Nesse caso a mensagem chega à DLQ sem atributo de motivo.
+
+**Limitação conhecida.** Como o contador inclui devoluções, uma seguidora pode chegar à vez dela já com `receiveCount` alto, e uma única falha transitória nela a levaria direto à DLQ do consumidor. O teste "falha persistente na frente e BET válida atrás" garante o caso principal: a líder vai para a DLQ e a seguidora é processada no mesmo lote, sem falhar. Contar tentativas reais exigiria guardar estado por mensagem fora do SQS, o que não compensa aqui.
+
+**Visibilidade ≥ `lock_timeout` + margem.** `SQS_CONSUMER_VISIBILITY_TIMEOUT_S` (default 30) é a visibilidade pedida no `ReceiveMessage`. A configuração recusa um valor menor que `DB_LOCK_TIMEOUT_MS` + 5 s (`CONSUMER_PROCESSING_MARGIN_MS`): o pior caso de uma mensagem é esperar o lock da wallet até o timeout, e a mensagem não pode reaparecer para outra instância enquanto a primeira ainda trabalha nela. Mesmo assim, se reaparecer, a inbox resolve (7.2). Pelo mesmo motivo, antes de **começar** cada mensagem o consumidor confere o prazo: se faltar menos que esse orçamento para a visibilidade acabar (mensagens no fim de um grupo longo), devolve a mensagem (`released_total{reason=lease_expiring}`) em vez de começar.
+
+**Concorrência abaixo do pool.** `SQS_CONSUMER_CONCURRENCY` (default 10) é o número de mensagens processadas em paralelo por instância. Cada uma segura uma conexão durante a transação. A configuração recusa `concorrência + 1 (publisher da outbox, se ligado) >= DB_POOL_MAX`, para que sempre sobre conexão para o HTTP e o health check.
+
+### 7.5 Lote, grupos e ordem
+O long polling (`WaitTimeSeconds` 20, até 10 mensagens) devolve um lote que pode ter vários `MessageGroupId`. O lote é dividido por grupo: **grupos em paralelo** (até a concorrência) e **mensagens do mesmo grupo em sequência**. Se uma mensagem fica para retry, as seguintes do mesmo grupo são devolvidas com visibilidade 0 (`released_total{reason=group_on_hold}`). O FIFO não entrega mensagens de um grupo enquanto outra do mesmo grupo está em voo, então elas voltam **depois** da que falhou.
+
+Isso é só otimização: `MessageGroupId = walletId` não é premissa de consistência. O teste de estresse (7.8) usa um `MessageGroupId` **diferente por mensagem** na mesma wallet, e três processos consomem em paralelo. A consistência vem do `FOR UPDATE` na wallet, da `UNIQUE` da idempotência e da PK da inbox.
+
+### 7.6 DLQ
+O consumidor envia para `wager-transactions-dlq.fifo` com `SendMessage` e só então faz o ack na fila de origem:
+- corpo idêntico ao original e **o mesmo `MessageGroupId`**;
+- `MessageDeduplicationId` = `MessageId` do SQS da original. Se o processo morrer entre a cópia e o ack, a redelivery copia de novo, e o FIFO da DLQ descarta a segunda dentro da janela de 5 min. Depois dela, a DLQ pode ter uma cópia duplicada, o que é inofensivo (ver abaixo);
+- atributos `failureReason`, `failureDetail` (até 256 caracteres, sem payload), `sourceMessageId` e `receiveCount`;
+- se o `SendMessage` falhar, **não há ack**: a mensagem volta pela visibilidade e nunca se perde.
+
+**Reenviar da DLQ para a fila é seguro.** O corpo é o mesmo, então o `messageId` do envelope e a key também são. Se a mensagem chegou a ser commitada (o que não acontece com erro permanente, mas pode acontecer numa cópia duplicada), a inbox a reconhece como duplicata. Se não, ela é processada normalmente, por exemplo depois que a wallet inexistente foi criada. Uma mensagem com `INBOX_MESSAGE_CONFLICT` continua em conflito se for reenviada, de propósito.
+
+### 7.7 Shutdown
+O `stop()` roda no `beforeApplicationShutdown` (`app.close()` ou SIGTERM), antes de o pool fechar:
+1. marca `stopping` e **aborta o long poll** em andamento (`AbortSignal` no `ReceiveMessage`);
+2. devolve **na hora** a visibilidade (0) de todas as mensagens recebidas que ainda não começaram, inclusive as que estão na fila de um grupo atrás de uma mensagem em andamento;
+3. espera as mensagens em andamento chegarem ao commit e ao ack (ou à decisão de retry ou DLQ).
+
+**Efeito do abort do long poll.** O abort cancela a requisição HTTP do lado do cliente. Se o SQS já tinha separado mensagens para essa resposta no instante do abort, elas ficam em voo com a visibilidade pedida (30 s) sem que o consumidor saiba delas, e voltam para a fila quando ela acaba. Nada se perde nem é processado: o custo é um atraso de até `SQS_CONSUMER_VISIBILITY_TIMEOUT_S` para essas mensagens. A alternativa, esperar o long poll terminar sozinho, atrasaria todo shutdown em até 20 s. Se a resposta chega junto com o abort, o lote inteiro é devolvido com visibilidade 0.
+
+A mesma limitação do Windows de 6.5 vale aqui: o teste de shutdown chama `stop()` diretamente, e a morte abrupta é coberta pelo teste de crash.

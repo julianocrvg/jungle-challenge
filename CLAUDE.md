@@ -145,6 +145,7 @@ Variáveis do banco: `DATABASE_URL`, `DB_POOL_MAX` (default 20) e `DB_LOCK_TIMEO
 
 Variáveis do SQS: `SQS_ENDPOINT` (default `http://localhost:4566`), `AWS_REGION`, `SQS_EVENTS_QUEUE_URL` (default `wager-events.fifo`).
 Publisher da outbox (ARCHITECTURE 6): `OUTBOX_PUBLISHER_ENABLED` (default true), `OUTBOX_BATCH_SIZE` (default 10, máx. 10), `OUTBOX_POLL_INTERVAL_MS` (500), `OUTBOX_SEND_TIMEOUT_MS` (5000), `OUTBOX_IDLE_TX_TIMEOUT_MS` (default e mínimo `max(3 × send, 15000)`).
+Consumidor de `wager-transactions.fifo` (ARCHITECTURE 7): `SQS_CONSUMER_ENABLED` (default true), `SQS_TRANSACTIONS_QUEUE_URL`, `SQS_TRANSACTIONS_DLQ_URL`, `SQS_CONSUMER_MAX_ATTEMPTS` (5; o redrive da fila precisa ser ≥ 3×), `SQS_CONSUMER_WAIT_SECONDS` (20), `SQS_CONSUMER_VISIBILITY_TIMEOUT_S` (30, ≥ lock_timeout + 5 s), `SQS_CONSUMER_CONCURRENCY` (10, + publisher < pool), `SQS_CONSUMER_BACKOFF_BASE_MS` (1000), `SQS_CONSUMER_BACKOFF_MAX_MS` (60000).
 Depois de mudar `docker/localstack/init-sqs.sh`: `docker compose up -d --force-recreate localstack`.
 
 Ajuste os scripts reais em `package.json` e mantenha esta seção atualizada.

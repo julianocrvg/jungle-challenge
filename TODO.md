@@ -50,8 +50,10 @@ Decisões em ARCHITECTURE.md, seção 7. Os dois lembretes antigos desta fatia (
 
 - [x] Inbox no use case: `ON CONFLICT ON CONSTRAINT inbox_pk DO NOTHING` antes do lock; hash da inbox = key + negócio; `INBOX_MESSAGE_CONFLICT`
 - [x] Parsing do envelope com o validador do HTTP; classificação permanente × transitória × inesperada
-- [ ] Adaptador SQS, worker (long polling, grupos, DLQ explícita, backoff, shutdown), configuração e métricas
-- [ ] Testes de integração do consumidor e teste multi-processo
+- [x] Adaptador SQS, worker (long polling, grupos, DLQ explícita, backoff, shutdown), configuração e métricas
+- [x] Redrive de `wager-transactions.fifo` em 15 (3 × 5), conferido no boot
+- [x] Testes: 10 entregas, messageId novo (replay), HTTP → SQS, venenosas, lock timeout, limite de tentativas com seguidora, REFUND antes da BET, shutdown, crash entre commit e ack
+- [ ] Teste de estresse multi-processo (3 consumidores, grupo por mensagem) e mesmo messageId concorrente
 
 ## Fatia 9 (observações herdadas da fatia 6)
 - [ ] `PublishOutboxBatch`: os contadores (`outbox_published_total` e retries) são incrementados antes do commit do lote; se o commit falhar, a métrica conta envios que serão refeitos. Mover para depois do commit

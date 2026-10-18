@@ -4,6 +4,8 @@ export type MetricLabels = Readonly<Record<string, string>>;
 export interface Metrics {
   increment(name: string, labels?: MetricLabels, value?: number): void;
   gauge(name: string, value: number, labels?: MetricLabels): void;
+  /** Uma observação de distribuição (latência, em segundos). */
+  observe(name: string, value: number, labels?: MetricLabels): void;
 }
 
 export const METRICS = Symbol('Metrics');
