@@ -156,6 +156,15 @@ describe('state transitions', () => {
     expect(tx.failureCode).toBe('PLAYER_MISMATCH');
   });
 
+  test('a rejected reversal may keep the resolved reference; a non-reversal may not', () => {
+    const refund = newTx({ kind: Kind.Refund, referenceExternalTransactionId: 'bet-1' });
+    refund.reject(FailureCode.AlreadyReversed, brl('5.00'), LATER, 'ref-id');
+    expect(refund.referenceTransactionId).toBe('ref-id');
+    expect(() => newTx().reject(FailureCode.InsufficientFunds, brl('5.00'), LATER, 'ref-id')).toThrow(
+      InvalidTransactionError,
+    );
+  });
+
   describe('PENDING_REFERENCE', () => {
     const pending = () => {
       const tx = reversalOf(processedTx());

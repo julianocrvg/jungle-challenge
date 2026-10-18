@@ -4,6 +4,7 @@ import { MikroOrmModule } from '@mikro-orm/nestjs';
 import { CLOCK, type Clock } from './application/ports/clock';
 import { ID_GENERATOR, type IdGenerator } from './application/ports/id-generator';
 import { UNIT_OF_WORK, type UnitOfWork } from './application/ports/unit-of-work';
+import { ResolvePendingReference } from './application/wagering/resolve-pending-reference';
 import { SubmitWagerTransaction } from './application/wagering/submit-wager-transaction';
 import { CreateWallet } from './application/wallets/create-wallet';
 import { type DatabaseSettings, databaseSettingsFromEnv } from './config';
@@ -48,6 +49,11 @@ export class AppModule {
         {
           provide: SubmitWagerTransaction,
           useFactory: (uow: UnitOfWork, ids: IdGenerator, clock: Clock) => new SubmitWagerTransaction(uow, ids, clock),
+          inject: useCaseDeps,
+        },
+        {
+          provide: ResolvePendingReference,
+          useFactory: (uow: UnitOfWork, ids: IdGenerator, clock: Clock) => new ResolvePendingReference(uow, ids, clock),
           inject: useCaseDeps,
         },
       ],

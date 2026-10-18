@@ -18,5 +18,18 @@ Decisões detalhadas em ARCHITECTURE.md, seções 5.2 a 5.9.
 - [x] Testes de integração HTTP: wallet, BET/WIN/LOSS, replay, conflitos 409, 404 sem persistir, `CURRENCY_MISMATCH`, `PLAYER_MISMATCH`, outbox atômica, 23505 desconhecido → 500, 503 com `Retry-After`
 - [x] Testes de concorrência: 2 apostas de 80 sobre 100; mesma aposta 50 vezes; 50 apostas na mesma wallet com zero 503 e zero `40P01`; sanidade do lock (transação externa segura o `FOR UPDATE`, duas requisições bloqueiam e completam depois)
 
-## Fatia 4b: reversões
-- [ ] Remover o 501; resolver a referência sob o lock (`validateReference`, `ALREADY_REVERSED`), `PENDING_REFERENCE` → 202, WIN e LOSS com referência
+## Fatia 4b: reversões e PENDING_REFERENCE (concluída)
+
+Decisões em ARCHITECTURE.md, seções 5.10 e 5.11.
+
+- [x] Remover o 501; hash calculado antes de tudo
+- [x] Regras compartilhadas (`wager-rules.ts`): referência resolvida sob o lock da wallet, `ALREADY_REVERSED` antes do INSERT, `AMOUNT_MISMATCH`, `REFERENCE_NOT_PROCESSED`, `REVERSAL_WOULD_OVERDRAW`
+- [x] Ausente, PENDING ou PENDING_REFERENCE → grava `PENDING_REFERENCE`, 202 e `WagerTransactionPendingReference`; o replay reflete o estado atual
+- [x] Reversão rejeitada guarda `reference_transaction_id` (auditoria)
+- [x] WIN e LOSS com referência: informativos
+- [x] `ResolvePendingReference`: lê sem lock → trava a wallet → relê → no-op se já não está pendente; UPDATE com guarda de status e conferência de linhas
+- [x] Testes: cada regra, replay, reversão antes da referência, dupla reversão concorrente, resolves concorrentes, REFUND e BET em paralelo
+
+## Fatia 8 (lembrete para o worker)
+- [ ] Respeitar a ordem de locks de 5.11: nunca travar `wager_transactions` antes da wallet
+- [ ] Limite de tentativas ou TTL → `REJECTED` `REFERENCE_NOT_FOUND` + evento (também encerra ROLLBACK de OPENING e referências de outro provider)

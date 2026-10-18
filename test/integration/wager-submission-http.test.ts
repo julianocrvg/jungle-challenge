@@ -303,14 +303,25 @@ describe('request validation', () => {
   });
 });
 
-describe('temporary 501 for transactions with a reference (until slice 4b)', () => {
-  test.each(['REFUND', 'ROLLBACK', 'WIN', 'LOSS'])('%s with referenceExternalTransactionId is a 501 and writes nothing', async (kind) => {
+describe('WIN and LOSS with a reference: informative only (ARCHITECTURE 5.10)', () => {
+  test.each([
+    ['WIN', '10.00', '110.00'],
+    ['LOSS', '0.00', '100.00'],
+  ])('%s pointing to a reference that does not exist is processed, stores it unresolved, and the reference is in the hash', async (kind, amount, balance) => {
     const w = await createWalletViaApi(api, '100.00');
-    const before = await footprint(w.id);
-    const result = await submit(api, wagerPayload(w, { kind, referenceExternalTransactionId: 'ext-bet-1' }));
-    expect(result.status).toBe(501);
-    expect(result.body.code).toBe('REFERENCE_NOT_SUPPORTED_YET');
-    expect(await footprint(w.id)).toEqual(before);
+    const payload = wagerPayload(w, { kind, money: brl(amount), referenceExternalTransactionId: 'ext-never-sent' });
+    const result = await submit(api, payload);
+    expect(result.status).toBe(200);
+    expect(result.body).toMatchObject({ status: 'PROCESSED', balance: brl(balance) });
+    const [row] = await sql(
+      `SELECT reference_external_transaction_id, reference_transaction_id FROM wager_transactions WHERE id = ?`,
+      [result.body.transactionId],
+    );
+    expect(row).toEqual({ reference_external_transaction_id: 'ext-never-sent', reference_transaction_id: null });
+
+    const otherReference = await submit(api, { ...payload, referenceExternalTransactionId: 'ext-other' });
+    expect(otherReference.status).toBe(409);
+    expect(otherReference.body.code).toBe('IDEMPOTENCY_KEY_CONFLICT');
   });
 });
 

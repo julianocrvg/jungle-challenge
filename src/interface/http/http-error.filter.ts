@@ -3,7 +3,6 @@ import {
   ExternalTransactionIdConflictError,
   IdempotencyKeyConflictError,
   InvalidCommandError,
-  ReferenceNotSupportedYetError,
   TransientInfrastructureError,
   WalletAlreadyExistsError,
   WalletNotFoundError,
@@ -51,7 +50,6 @@ export function toHttpError(error: unknown): HttpError {
   ) {
     return of(409, error);
   }
-  if (error instanceof ReferenceNotSupportedYetError) return of(501, error);
   if (error instanceof TransientInfrastructureError) {
     return { ...of(503, error), retryAfterSeconds: RETRY_AFTER_SECONDS };
   }
@@ -85,7 +83,7 @@ export class HttpErrorFilter implements ExceptionFilter {
 
   // Sem payload nem valores financeiros: só o tipo do erro, a mensagem e a constraint/SQLSTATE.
   private log(error: unknown, httpError: HttpError): void {
-    if (httpError.status < 500 || httpError.status === 501) return;
+    if (httpError.status < 500) return;
     const e = error instanceof Error ? error : new Error(String(error));
     const cause = (e as { cause?: unknown }).cause ?? e;
     const context = JSON.stringify({

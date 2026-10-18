@@ -10,23 +10,35 @@ export interface TransactionResponse {
   transactionId: string;
   status: WagerTransactionStatus;
   failureCode: FailureCode | null;
-  balance: MoneyProps;
+  /** Saldo observado ao terminar. `null` em PENDING_REFERENCE, que ainda não observou saldo. */
+  balance: MoneyProps | null;
   idempotentReplay: boolean;
 }
 
-/** PROCESSED: 200. REJECTED: 422, com failureCode. O replay repete o status da resposta original. */
+/**
+ * PROCESSED: 200. REJECTED: 422, com failureCode. PENDING_REFERENCE: 202. O replay usa o estado atual da
+ * transação: 202 enquanto pendente, e o resultado final depois de resolvida (ARCHITECTURE 5.10).
+ */
 export function statusCodeFor(status: WagerTransactionStatus): number {
-  return status === WagerTransactionStatus.Rejected ? 422 : 200;
+  switch (status) {
+    case WagerTransactionStatus.Rejected:
+      return 422;
+    case WagerTransactionStatus.PendingReference:
+      return 202;
+    default:
+      return 200;
+  }
 }
 
 export function toTransactionResponse({ transaction, idempotentReplay }: SubmissionResult): TransactionResponse {
   const balance = transaction.balanceAfter;
-  if (balance === undefined) throw new Error(`Transaction ${transaction.id} has no observed balance`);
+  const pending = transaction.status === WagerTransactionStatus.PendingReference;
+  if (balance === undefined && !pending) throw new Error(`Transaction ${transaction.id} has no observed balance`);
   return {
     transactionId: transaction.id,
     status: transaction.status,
     failureCode: transaction.failureCode ?? null,
-    balance: balance.toJSON(),
+    balance: balance?.toJSON() ?? null,
     idempotentReplay,
   };
 }

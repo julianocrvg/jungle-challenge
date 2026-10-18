@@ -34,11 +34,6 @@ export class ExternalTransactionIdConflictError extends ApplicationError {
   readonly code = 'EXTERNAL_TRANSACTION_ID_CONFLICT';
 }
 
-/** Temporário até a fatia 4b: transações com referência ainda não são processadas. */
-export class ReferenceNotSupportedYetError extends ApplicationError {
-  readonly code = 'REFERENCE_NOT_SUPPORTED_YET';
-}
-
 /** Banco indisponível, timeout de lock, deadlock, falha de serialização: pode ser reenviado com segurança. */
 export class TransientInfrastructureError extends ApplicationError {
   readonly code = 'SERVICE_UNAVAILABLE';

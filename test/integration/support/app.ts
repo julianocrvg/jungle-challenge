@@ -102,7 +102,8 @@ export interface TransactionBody {
   transactionId: string;
   status: string;
   failureCode: string | null;
-  balance: { amount: string; currency: string };
+  /** `null` em PENDING_REFERENCE. */
+  balance: { amount: string; currency: string } | null;
   idempotentReplay: boolean;
 }
 

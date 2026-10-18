@@ -19,6 +19,17 @@ export interface WagerTransactionRepository {
    */
   insertIfAbsent(tx: WagerTransaction): Promise<boolean>;
   findByIdempotencyKey(idempotencyKey: string): Promise<WagerTransaction | undefined>;
+  /** Leitura simples, sem lock. Quem decide com base no status precisa ter travado a wallet antes. */
+  findById(id: string): Promise<WagerTransaction | undefined>;
+  /** Resolução de referência: `(provider_id, external_transaction_id)`, sem lock (ARCHITECTURE 5.10). */
+  findByProviderAndExternalId(providerId: string, externalTransactionId: string): Promise<WagerTransaction | undefined>;
+  /** Existe REFUND ou ROLLBACK PROCESSED desta referência? Só é confiável sob o lock da wallet. */
+  existsProcessedReversalOf(referenceTransactionId: string): Promise<boolean>;
+  /**
+   * `UPDATE ... WHERE id = ? AND status = 'PENDING_REFERENCE'`, com o estado atual de `tx`. Só pode ser chamado
+   * sob o lock da wallet; lança se o número de linhas afetadas não for 1 (bug: a linha já foi relida sob o lock).
+   */
+  updatePendingReference(tx: WagerTransaction): Promise<void>;
 }
 
 export interface LedgerRepository {

@@ -278,14 +278,19 @@ export class WagerTransaction {
   /**
    * Rejeição por regra de negócio: não mexe em saldo, mas guarda o saldo observado para o replay.
    * O saldo está na moeda da wallet, que difere da transação em CURRENCY_MISMATCH (ARCHITECTURE 5.8).
+   * Uma reversão rejeitada depois de encontrar a referência guarda o vínculo, para auditoria (ARCHITECTURE 5.10).
    */
-  reject(code: FailureCode, balanceAfter: Money, at: Date): void {
+  reject(code: FailureCode, balanceAfter: Money, at: Date, referenceTransactionId?: string): void {
     this.assertNotTerminal('reject');
     if (code === FailureCode.InternalError) {
       throw new InvalidTransactionError('INTERNAL_ERROR is a failure, not a rejection');
     }
+    if (referenceTransactionId !== undefined && !this.requiresReference()) {
+      throw new InvalidTransactionError(`${this.kind} has no resolved reference`);
+    }
     this.assertObservedBalance(balanceAfter);
     this._status = WagerTransactionStatus.Rejected;
+    this._referenceTransactionId = referenceTransactionId;
     this._failureCode = code;
     this._balanceAfter = balanceAfter;
     this._processedAt = at;

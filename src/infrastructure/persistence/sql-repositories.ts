@@ -111,7 +111,47 @@ class SqlWagerTransactionRepository implements WagerTransactionRepository {
     }
   }
 
-  async findByIdempotencyKey(idempotencyKey: string): Promise<WagerTransaction | undefined> {
+  findByIdempotencyKey(idempotencyKey: string): Promise<WagerTransaction | undefined> {
+    return this.findOne('t.idempotency_key = ?', [idempotencyKey]);
+  }
+
+  findById(id: string): Promise<WagerTransaction | undefined> {
+    return this.findOne('t.id = ?', [id]);
+  }
+
+  findByProviderAndExternalId(providerId: string, externalTransactionId: string): Promise<WagerTransaction | undefined> {
+    return this.findOne('t.provider_id = ? AND t.external_transaction_id = ?', [providerId, externalTransactionId]);
+  }
+
+  async existsProcessedReversalOf(referenceTransactionId: string): Promise<boolean> {
+    // Mesmo predicado do índice wt_single_reversal_uq: a checagem e a rede de proteção falam da mesma coisa.
+    const rows = await this.em.execute<Row[]>(
+      `SELECT 1 FROM wager_transactions
+       WHERE reference_transaction_id = ? AND kind IN ('REFUND','ROLLBACK') AND status = 'PROCESSED'
+       LIMIT 1`,
+      [referenceTransactionId],
+    );
+    return rows.length > 0;
+  }
+
+  async updatePendingReference(tx: WagerTransaction): Promise<void> {
+    // O filtro por status é a guarda: só uma transição sai de PENDING_REFERENCE. Com a linha relida sob o
+    // lock da wallet, zero linhas aqui é bug, e a transação inteira é desfeita.
+    const rows = await this.em.execute<Row[]>(
+      `UPDATE wager_transactions
+       SET status = ?, failure_code = ?, balance_after = ?, reference_transaction_id = ?, attempts = ?,
+           next_attempt_at = ?, processed_at = ?
+       WHERE id = ? AND status = 'PENDING_REFERENCE'
+       RETURNING id`,
+      [tx.status, tx.failureCode ?? null, tx.balanceAfter?.toJSON().amount ?? null, tx.referenceTransactionId ?? null,
+        tx.attempts, tx.nextAttemptAt ?? null, tx.processedAt ?? null, tx.id],
+    );
+    if (rows.length !== 1) {
+      throw new Error(`Transaction ${tx.id} was no longer PENDING_REFERENCE under the wallet lock`);
+    }
+  }
+
+  private async findOne(where: string, params: unknown[]): Promise<WagerTransaction | undefined> {
     // O saldo observado está na moeda da wallet (ARCHITECTURE 5.8), por isso o JOIN.
     const [row] = await this.em.execute<Row[]>(
       `SELECT t.id, t.provider_id, t.external_transaction_id, t.idempotency_key, t.payload_hash, t.wallet_id,
@@ -120,8 +160,8 @@ class SqlWagerTransactionRepository implements WagerTransactionRepository {
               t.balance_after::text AS balance_after, t.attempts, t.next_attempt_at, t.created_at, t.processed_at,
               w.currency AS wallet_currency
        FROM wager_transactions t JOIN wallets w ON w.id = t.wallet_id
-       WHERE t.idempotency_key = ?`,
-      [idempotencyKey],
+       WHERE ${where}`,
+      params,
     );
     if (row === undefined) return undefined;
     const balanceAfter = optional(row, 'balance_after');
