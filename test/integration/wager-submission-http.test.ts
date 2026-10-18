@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { createTestOrm, type Sql, sqlRunner, walletsDivergingFromLedger } from './support/database';
 import {
   createWalletViaApi,
@@ -24,6 +24,9 @@ afterAll(async () => {
   await api?.close();
   await closeOrm?.();
 });
+
+// Cada teste só enxerga os próprios logs.
+beforeEach(() => api.logger.clear());
 
 const brl = (amount: string) => ({ amount, currency: 'BRL' });
 

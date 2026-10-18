@@ -32,6 +32,9 @@ export class CapturingLogger implements LoggerService {
   verbose(message: unknown): void { this.push('verbose', message); }
   fatal(message: unknown): void { this.push('fatal', message); }
 
+  /** Chamado num beforeEach: cada teste só enxerga os próprios logs. */
+  clear(): void { this.entries.length = 0; }
+
   private push(level: LogEntry['level'], message: unknown): void {
     this.entries.push({ level, message: String(message) });
   }

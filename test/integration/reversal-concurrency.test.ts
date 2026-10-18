@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { ResolvePendingReference } from '../../src/application/wagering/resolve-pending-reference';
 import { createTestOrm, type Sql, sqlRunner, walletsDivergingFromLedger } from './support/database';
 import { createWalletViaApi, startTestApp, submit, type TestApp, wagerPayload, type WalletBody } from './support/app';
@@ -27,6 +27,9 @@ afterAll(async () => {
   await api?.close();
   await closeOrm?.();
 });
+
+// Os logs se acumulariam entre os testes: sem isto, um erro de um teste contaminaria a checagem dos seguintes.
+beforeEach(() => api.logger.clear());
 
 const brl = (amount: string) => ({ amount, currency: 'BRL' });
 
