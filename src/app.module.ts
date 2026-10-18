@@ -49,7 +49,8 @@ import { InMemoryMetrics } from './infrastructure/metrics/in-memory-metrics';
 import { MikroOrmUnitOfWork } from './infrastructure/persistence/mikro-orm-unit-of-work';
 import { createOrmConfig } from './infrastructure/persistence/mikro-orm.config';
 import { HealthController } from './interface/http/health.controller';
-import { WageringTransactionsController } from './interface/http/wagering-transactions.controller';
+import { ProviderTransactionsController, WageringTransactionsController } from './interface/http/wagering-transactions.controller';
+import { GetWagerTransaction } from './application/wagering/get-wager-transaction';
 import { WalletsController } from './interface/http/wallets.controller';
 import { OutboxPublisherWorker } from './interface/workers/outbox-publisher.worker';
 import { PendingReferenceWorker } from './interface/workers/pending-reference.worker';
@@ -102,7 +103,7 @@ export class AppModule {
     return {
       module: AppModule,
       imports: [MikroOrmModule.forRoot(createOrmConfig(database.url, { poolMax: database.poolMax }))],
-      controllers: [HealthController, WalletsController, WageringTransactionsController],
+      controllers: [HealthController, WalletsController, WageringTransactionsController, ProviderTransactionsController],
       providers: [
         { provide: ID_GENERATOR, useValue: options.idGenerator ?? new BunIdGenerator() },
         { provide: CLOCK, useValue: options.clock ?? new SystemClock() },
@@ -116,6 +117,7 @@ export class AppModule {
           useFactory: (orm: MikroORM) => new MikroOrmUnitOfWork(orm, database.lockTimeoutMs),
           inject: [MikroORM],
         },
+        { provide: GetWagerTransaction, useFactory: (uow: UnitOfWork) => new GetWagerTransaction(uow), inject: [UNIT_OF_WORK] },
         {
           provide: WALLET_QUERIES,
           useFactory: (orm: MikroORM) => new SqlWalletQueries(orm),

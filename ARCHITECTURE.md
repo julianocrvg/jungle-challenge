@@ -445,3 +445,12 @@ As consultas de wallet e ledger passam pela porta `WalletQueries` (`SqlWalletQue
 - **Fim da lista:** a query pede `limit + 1` linhas; a linha extra só indica que há próxima página (sem `COUNT`). Na última página `nextCursor` é `null`, inclusive quando o total é múltiplo exato do limite.
 - **Por que é estável durante escrita concorrente.** A `wallet_version` de um lançamento é atribuída sob o `FOR UPDATE` da wallet, que só cai no commit. A versão N+1 só pode ser calculada depois do commit da N. Logo nenhuma versão menor que o cursor aparece depois que ele foi emitido: sem entrada repetida e sem entrada perdida. `created_at` não serviria (empata e não é ordenado pelo commit).
 - Wallet sem lançamentos: `entries: []` e `nextCursor: null` (um `LEFT JOIN` distingue isso de wallet inexistente numa só instrução).
+
+### 9.3 Consulta de transação
+`GET /wagering/transactions/:transactionId` e `GET /providers/:providerId/wagering/transactions/:externalTransactionId` (a segunda pela chave natural `wt_provider_external_uq`) devolvem o mesmo corpo da submissão, `{transactionId, status, failureCode, balance, idempotentReplay}`, e usam o mesmo mapeamento de erros dos demais endpoints.
+- **Status HTTP: sempre 200 quando a transação existe.** O 200/202/422 de 5.9 descreve o **resultado de uma submissão ou de um replay** (o cliente precisa saber, só pelo código, se a operação foi aceita, está pendente ou foi recusada). Numa consulta o pedido em si deu certo: o estado da transação (`status`, `failureCode`, `balance`) é dado do corpo, inclusive para REJECTED e PENDING_REFERENCE. Quem consulta lê o corpo, não o código.
+- **`idempotentReplay` é sempre `false`.** Uma consulta não reenvia nada; o campo existe só para o corpo ser idêntico ao da submissão.
+- **404 `TRANSACTION_NOT_FOUND`** quando não existe (código legível por máquina, distinto de `WALLET_NOT_FOUND`); a consulta não persiste nada. Ids malformados (`transactionId` fora de UUID) dão 400.
+- **OPENING não existe para a API.** É interna (5.6) e nunca entra por ela; por simetria também não sai: a consulta responde 404 (o provider reservado `internal` cai no mesmo caso).
+- **Chave natural na rota.** `providerId` e `externalTransactionId` chegam decodificados (`%2F`, espaços, `%25`, `#`, `?`, acentos) e passam pela mesma validação de texto do payload.
+- Leitura simples, sem lock, numa transação curta; não decide nada com base no status, então não precisa do lock da wallet (5.1).

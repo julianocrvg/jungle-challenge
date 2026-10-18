@@ -1,9 +1,13 @@
-import { Body, Controller, Headers, Inject, Post, Res } from '@nestjs/common';
+import { Body, Controller, Get, Headers, Inject, Param, Post, Res, UseGuards } from '@nestjs/common';
 import { ID_GENERATOR, type IdGenerator } from '../../application/ports/id-generator';
+import { GetWagerTransaction } from '../../application/wagering/get-wager-transaction';
 import { type SubmissionResult, SubmitWagerTransaction } from '../../application/wagering/submit-wager-transaction';
 import type { MoneyProps } from '../../domain/money';
 import { type FailureCode, WagerTransactionStatus } from '../../domain/wager-transaction';
-import { correlationIdFrom, parseIdempotencyKey, parseWagerTransactionPayload } from './validation';
+import { AuthGuard } from './auth.guard';
+import {
+  correlationIdFrom, parseIdempotencyKey, parseIdentifierParam, parseUuidParam, parseWagerTransactionPayload,
+} from './validation';
 
 /** Corpo único das respostas de transação, na primeira vez e no replay (ARCHITECTURE 5.9). */
 export interface TransactionResponse {
@@ -30,7 +34,7 @@ export function statusCodeFor(status: WagerTransactionStatus): number {
   }
 }
 
-export function toTransactionResponse({ transaction, idempotentReplay }: SubmissionResult): TransactionResponse {
+export function toTransactionResponse({ transaction, idempotentReplay }: Pick<SubmissionResult, 'transaction' | 'idempotentReplay'>): TransactionResponse {
   const balance = transaction.balanceAfter;
   const pending = transaction.status === WagerTransactionStatus.PendingReference;
   if (balance === undefined && !pending) throw new Error(`Transaction ${transaction.id} has no observed balance`);
@@ -48,9 +52,11 @@ interface StatusResponse {
 }
 
 @Controller('wagering/transactions')
+@UseGuards(AuthGuard)
 export class WageringTransactionsController {
   constructor(
     @Inject(SubmitWagerTransaction) private readonly submitTransaction: SubmitWagerTransaction,
+    @Inject(GetWagerTransaction) private readonly getTransaction: GetWagerTransaction,
     @Inject(ID_GENERATOR) private readonly ids: IdGenerator,
   ) {}
 
@@ -70,5 +76,31 @@ export class WageringTransactionsController {
     });
     response.status(statusCodeFor(result.transaction.status));
     return toTransactionResponse(result);
+  }
+
+  /** Consulta: sempre 200 com o estado atual no corpo (ARCHITECTURE 9.3). 404 TRANSACTION_NOT_FOUND se não existe. */
+  @Get(':transactionId')
+  async get(@Param('transactionId') transactionId: string): Promise<TransactionResponse> {
+    const transaction = await this.getTransaction.byId(parseUuidParam(transactionId, 'transactionId'));
+    return toTransactionResponse({ transaction, idempotentReplay: false });
+  }
+}
+
+/** Mesma consulta, pela chave natural do provedor. */
+@Controller('providers')
+@UseGuards(AuthGuard)
+export class ProviderTransactionsController {
+  constructor(@Inject(GetWagerTransaction) private readonly getTransaction: GetWagerTransaction) {}
+
+  @Get(':providerId/wagering/transactions/:externalTransactionId')
+  async get(
+    @Param('providerId') providerId: string,
+    @Param('externalTransactionId') externalTransactionId: string,
+  ): Promise<TransactionResponse> {
+    const transaction = await this.getTransaction.byProviderAndExternalId(
+      parseIdentifierParam(providerId, 'providerId'),
+      parseIdentifierParam(externalTransactionId, 'externalTransactionId'),
+    );
+    return toTransactionResponse({ transaction, idempotentReplay: false });
   }
 }
