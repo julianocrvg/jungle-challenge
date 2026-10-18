@@ -1,3 +1,5 @@
+import { hostname } from 'node:os';
+
 /** Configuração lida do ambiente. Só inteiros de infraestrutura: nenhum valor monetário passa por aqui. */
 export interface DatabaseSettings {
   url: string;
@@ -244,6 +246,19 @@ function positiveInteger(env: Record<string, string | undefined>, name: string, 
     throw new Error(`${name} must be a positive integer, got "${raw}"`);
   }
   return Number.parseInt(raw, 10);
+}
+
+/**
+ * Identidade desta instância nos logs e no header `X-Instance-Id` (ARCHITECTURE 10.2). Default: host e pid, que
+ * já distinguem processos na mesma máquina. Texto de diagnóstico, nunca usado para decidir nada.
+ */
+export function instanceIdFromEnv(env: Record<string, string | undefined> = process.env): string {
+  const raw = env.INSTANCE_ID;
+  if (raw === undefined || raw === '') return `${hostname()}-${process.pid}`;
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(raw)) {
+    throw new Error(`INSTANCE_ID must be 1 to 64 characters of [A-Za-z0-9._-], got "${raw}"`);
+  }
+  return raw;
 }
 
 /** Paginação do ledger (ARCHITECTURE 9.2). */

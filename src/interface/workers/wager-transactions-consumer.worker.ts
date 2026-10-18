@@ -27,6 +27,8 @@ export interface WagerConsumerOptions {
   receiveErrorDelayMs: number;
   /** maxReceiveCount do redrive precisa ser pelo menos este múltiplo de maxAttempts (7.4). */
   redriveSafetyFactor: number;
+  /** Vai no log de cada mensagem: mostra qual instância a consumiu (ARCHITECTURE 10.2). */
+  instanceId?: string;
 }
 
 type Next = 'continue' | 'hold-group';
@@ -180,6 +182,7 @@ export class WagerTransactionsConsumer {
   private async handle(message: ReceivedMessage): Promise<Next> {
     const started = performance.now();
     let context: Record<string, string | number | undefined> = {
+      instanceId: this.options.instanceId,
       sqsMessageId: message.transportId,
       receiveCount: message.receiveCount,
     };

@@ -61,6 +61,14 @@ describe('health endpoints', () => {
     expect(await get(app, '/health/live')).toMatchObject({ status: 200, body: { status: 'ok' } });
   });
 
+  test('every response carries X-Instance-Id, error responses included', async () => {
+    const app = await start({ instanceId: 'health-a' });
+    expect((await fetch(`${app.baseUrl}/health/live`)).headers.get('x-instance-id')).toBe('health-a');
+    const notFound = await fetch(`${app.baseUrl}/wallets/${Bun.randomUUIDv7()}`);
+    expect(notFound.status).toBe(404);
+    expect(notFound.headers.get('x-instance-id')).toBe('health-a');
+  });
+
   test('with the consumer on, ready also checks the transactions queue and its DLQ', async () => {
     const app = await start({
       consumer: { enabled: true, queueUrl: queues.queueUrl, deadLetterQueueUrl: queues.dlqUrl, waitTimeSeconds: 1, maxAttempts: MAX_ATTEMPTS },

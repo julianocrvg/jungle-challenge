@@ -24,6 +24,7 @@ import {
   consumerSettingsFromEnv,
   type DatabaseSettings,
   databaseSettingsFromEnv,
+  instanceIdFromEnv,
   type LedgerSettings,
   ledgerSettingsFromEnv,
   validateLedgerSettings,
@@ -75,6 +76,8 @@ export interface AppOptions {
   clock?: Clock;
   eventPublisher?: EventPublisher;
   metrics?: Metrics;
+  /** Default: `INSTANCE_ID` ou host-pid (ARCHITECTURE 10.2). */
+  instanceId?: string;
 }
 
 /** Erro inesperado no consumidor: retry curto até o limite de tentativas (ARCHITECTURE 7.3). */
@@ -107,6 +110,7 @@ export class AppModule {
       maxAttempts: pending.maxAttempts,
       backoff: { baseMs: pending.backoffBaseMs, maxMs: pending.backoffMaxMs },
     };
+    const instanceId = options.instanceId ?? instanceIdFromEnv();
     const useCaseDeps = [UNIT_OF_WORK, ID_GENERATOR, CLOCK];
     return {
       module: AppModule,
@@ -234,6 +238,7 @@ export class AppModule {
               processingBudgetMs: consumerProcessingBudgetMs(database),
               receiveErrorDelayMs: 1_000,
               redriveSafetyFactor: REDRIVE_SAFETY_FACTOR,
+              instanceId,
             }),
           inject: [SubmitWagerTransaction, MESSAGE_QUEUE, METRICS],
         },

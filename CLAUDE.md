@@ -137,6 +137,7 @@ bun run typecheck             # tsc --noEmit
 bun test                      # todos os testes
 bun test test/integration     # só uma pasta/arquivo (filtro por caminho)
 bun test -t "<nome do teste>" # filtro por nome do teste
+bun run test:multi-instance   # 3 processos reais da API: concorrência, crash e reinício (~1 min)
 ```
 
 Postgres na porta 5433 porque há um PostgreSQL local na 5432. Testes usam o banco `wagering_test` (`TEST_DATABASE_URL`).
@@ -147,6 +148,7 @@ Variáveis do SQS: `SQS_ENDPOINT` (default `http://localhost:4566`), `AWS_REGION
 Publisher da outbox (ARCHITECTURE 6): `OUTBOX_PUBLISHER_ENABLED` (default true), `OUTBOX_BATCH_SIZE` (default 10, máx. 10), `OUTBOX_POLL_INTERVAL_MS` (500), `OUTBOX_SEND_TIMEOUT_MS` (5000), `OUTBOX_IDLE_TX_TIMEOUT_MS` (default e mínimo `max(3 × send, 15000)`).
 Consumidor de `wager-transactions.fifo` (ARCHITECTURE 7): `SQS_CONSUMER_ENABLED` (default true), `SQS_TRANSACTIONS_QUEUE_URL`, `SQS_TRANSACTIONS_DLQ_URL`, `SQS_CONSUMER_MAX_ATTEMPTS` (5; o redrive da fila precisa ser ≥ 3×), `SQS_CONSUMER_WAIT_SECONDS` (20), `SQS_CONSUMER_VISIBILITY_TIMEOUT_S` (30, ≥ lock_timeout + 5 s), `SQS_CONSUMER_CONCURRENCY` (10), `SQS_CONSUMER_BACKOFF_BASE_MS` (1000), `SQS_CONSUMER_BACKOFF_MAX_MS` (60000).
 Worker de PENDING_REFERENCE (ARCHITECTURE 8): `PENDING_REFERENCE_WORKER_ENABLED` (default true), `PENDING_REFERENCE_POLL_INTERVAL_MS` (1000), `PENDING_REFERENCE_BATCH_SIZE` (50), `PENDING_REFERENCE_CONCURRENCY` (4), `PENDING_REFERENCE_TTL_MS` (3600000), `PENDING_REFERENCE_MAX_ATTEMPTS` (30), `PENDING_REFERENCE_BACKOFF_BASE_MS` (1000), `PENDING_REFERENCE_BACKOFF_MAX_MS` (300000).
+Instância (ARCHITECTURE 10.2): `INSTANCE_ID` (default `host-pid`), devolvido no header `X-Instance-Id` e logado em cada mensagem consumida.
 Ledger paginado (ARCHITECTURE 9.2): `LEDGER_DEFAULT_PAGE_SIZE` (50) e `LEDGER_MAX_PAGE_SIZE` (100).
 Orçamento do pool (ARCHITECTURE 8.5): consumidor + publisher (1) + worker de pendentes ≤ `DB_POOL_MAX` − 5, validado no boot.
 Depois de mudar `docker/localstack/init-sqs.sh`: `docker compose up -d --force-recreate localstack`.

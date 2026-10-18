@@ -55,7 +55,17 @@ Decisões em ARCHITECTURE.md, seção 7. Os dois lembretes antigos desta fatia (
 - [x] Testes: 10 entregas, messageId novo (replay), HTTP → SQS, venenosas, lock timeout, limite de tentativas com seguidora, REFUND antes da BET, shutdown, crash entre commit e ack
 - [x] Teste de estresse multi-processo (3 consumidores, grupo por mensagem) e mesmo messageId concorrente
 
+## Fatia 10: múltiplas instâncias, crash e reinício (concluída)
+
+Decisões em ARCHITECTURE.md, seção 10.
+
+- [x] Teste de mutação da reconciliação: duas leituras separadas falham o teste paralelo em 3 de 3 rodadas; restaurado
+- [x] `/health/ready` (Postgres e filas SQS, teto de 2 s por check); `/health/live` sem tocar dependências
+- [x] `INSTANCE_ID`: header `X-Instance-Id` em toda resposta e `instanceId` no log de cada mensagem consumida
+- [x] `multi-instance.test.ts` (`bun run test:multi-instance`): 3 processos reais; 2 × 80 em 20 wallets, mesma aposta 50 vezes, wallets distintas, REFUND antes da BET em instâncias diferentes, crash com trabalho em voo, reinício completo com redeliveries
+
 ## Fatia 9 (observações herdadas das fatias 6 a 8)
+- [ ] Logs JSON de verdade: hoje o Nest imprime texto com o JSON embutido; a varredura de `multi-instance.test.ts` procura padrões no texto
 - [ ] Auditar todos os pontos de log (filtro de exceções HTTP, publisher da outbox, worker de pendentes): nunca registrar `error.message` nem `stack` com texto livre. Só nome do erro, SQLSTATE, nome da constraint e frames do stack (o mesmo critério do consumidor SQS, commit 33a7b9d)
 - [ ] Estender o `afterEach` de "nenhum valor monetário em log" aos testes de HTTP, do publisher e do worker de pendentes
 - [ ] `PublishOutboxBatch`: os contadores (`outbox_published_total` e retries) são incrementados antes do commit do lote; se o commit falhar, a métrica conta envios que serão refeitos. Mover para depois do commit

@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   type ConsumerSettings,
   consumerSettingsFromEnv,
+  instanceIdFromEnv,
   pendingReferenceSettingsFromEnv,
   validateConsumerSettings,
   validatePendingReferenceSettings,
@@ -71,5 +72,14 @@ describe('pool budget', () => {
     expect(() => validatePoolBudget({ poolMax: 5 }, { consumerConcurrency: 0, outboxPublishers: 1, pendingReferenceConcurrency: 0 }))
       .toThrow(/DB_POOL_MAX/);
     expect(() => validatePoolBudget({ poolMax: 30 }, { ...workers, consumerConcurrency: 20 })).not.toThrow();
+  });
+});
+
+describe('instance id', () => {
+  test('INSTANCE_ID when set; host-pid by default; refuses anything outside [A-Za-z0-9._-]{1,64}', () => {
+    expect(instanceIdFromEnv({ INSTANCE_ID: 'api-1' })).toBe('api-1');
+    expect(instanceIdFromEnv({})).toEndWith(`-${process.pid}`);
+    expect(() => instanceIdFromEnv({ INSTANCE_ID: 'a b' })).toThrow('INSTANCE_ID');
+    expect(() => instanceIdFromEnv({ INSTANCE_ID: 'x'.repeat(65) })).toThrow('INSTANCE_ID');
   });
 });
