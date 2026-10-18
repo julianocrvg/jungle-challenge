@@ -49,8 +49,22 @@ export interface SubmissionResult {
   idempotentReplay: boolean;
 }
 
+/**
+ * Lista explícita de campos: qualquer campo extra que chegue em runtime (por exemplo, metadados de transporte
+ * de uma mensagem SQS) fica fora do hash. `referenceExternalTransactionId` entra só quando existe.
+ */
 export function hashWagerPayload(payload: WagerTransactionPayload): string {
-  return payloadHash({ ...payload, money: { amount: payload.money.amount, currency: payload.money.currency } });
+  return payloadHash({
+    providerId: payload.providerId,
+    externalTransactionId: payload.externalTransactionId,
+    playerId: payload.playerId,
+    walletId: payload.walletId,
+    roundId: payload.roundId,
+    gameId: payload.gameId,
+    kind: payload.kind,
+    money: { amount: payload.money.amount, currency: payload.money.currency },
+    referenceExternalTransactionId: payload.referenceExternalTransactionId,
+  });
 }
 
 /**

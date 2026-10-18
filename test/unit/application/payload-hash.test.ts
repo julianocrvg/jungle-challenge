@@ -44,6 +44,19 @@ describe('payloadHash', () => {
     expect(hashWagerPayload({ ...payload, referenceExternalTransactionId: 'ext-1' })).not.toBe(base);
   });
 
+  test('ignores transport metadata at the top level, with or without a reference', () => {
+    const withMeta = { ...payload, messageId: 'm-1', receiveCount: 3 } as unknown as WagerTransactionPayload;
+    expect(hashWagerPayload(withMeta)).toBe(hashWagerPayload(payload));
+    const reversal = { ...payload, kind: WagerTransactionKind.Refund, referenceExternalTransactionId: 'bet-1' };
+    expect(hashWagerPayload({ ...reversal, messageId: 'm-2' } as unknown as WagerTransactionPayload)).toBe(
+      hashWagerPayload(reversal),
+    );
+  });
+
+  test('an absent reference and an undefined reference hash the same', () => {
+    expect(hashWagerPayload({ ...payload, referenceExternalTransactionId: undefined })).toBe(hashWagerPayload(payload));
+  });
+
   test('ignores fields outside the business payload (extra money keys are dropped)', () => {
     const withExtra = { ...payload, money: { ...payload.money, note: 'x' } } as unknown as WagerTransactionPayload;
     expect(hashWagerPayload(withExtra)).toBe(hashWagerPayload(payload));
