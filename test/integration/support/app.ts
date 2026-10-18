@@ -58,11 +58,13 @@ export interface TestApp {
 /** Sobe a API de verdade (Nest + Postgres de teste) numa porta livre. O schema deve ter sido criado antes. */
 export async function startTestApp(options: CreateAppOptions = {}): Promise<TestApp> {
   const ids = new ScriptedIdGenerator();
-  const logger = new CapturingLogger();
+  // O logger do Nest é estático: o último app criado recebe os logs de `new Logger(...)` de todos. Testes com
+  // vários apps passam um CapturingLogger compartilhado para não perder nenhuma entrada.
+  const logger = options.logger instanceof CapturingLogger ? options.logger : new CapturingLogger();
   const app = await createApp({
     idGenerator: ids,
-    logger,
     ...options,
+    logger,
     database: { url: TEST_DATABASE_URL, ...options.database },
     // Desligado por padrão: os testes de HTTP conferem a outbox e não podem ter um publisher concorrente.
     outbox: { enabled: false, ...options.outbox },

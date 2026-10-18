@@ -7,6 +7,7 @@ import { EVENT_PUBLISHER, type EventPublisher } from './application/ports/event-
 import { ID_GENERATOR, type IdGenerator } from './application/ports/id-generator';
 import { METRICS, type Metrics } from './application/ports/metrics';
 import { UNIT_OF_WORK, type UnitOfWork } from './application/ports/unit-of-work';
+import { PendingReferenceQueries } from './application/wagering/pending-reference-queries';
 import { ResolvePendingReference } from './application/wagering/resolve-pending-reference';
 import { SubmitWagerTransaction } from './application/wagering/submit-wager-transaction';
 import { CreateWallet } from './application/wallets/create-wallet';
@@ -44,6 +45,7 @@ import { HealthController } from './interface/http/health.controller';
 import { WageringTransactionsController } from './interface/http/wagering-transactions.controller';
 import { WalletsController } from './interface/http/wallets.controller';
 import { OutboxPublisherWorker } from './interface/workers/outbox-publisher.worker';
+import { PendingReferenceWorker } from './interface/workers/pending-reference.worker';
 
 /** Pontos de substituição para testes: banco, SQS, outbox, gerador de ids, relógio, broker e métricas. */
 export interface AppOptions {
@@ -120,6 +122,22 @@ export class AppModule {
           useFactory: (uow: UnitOfWork, ids: IdGenerator, clock: Clock) =>
             new ResolvePendingReference(uow, ids, clock, pendingPolicy),
           inject: useCaseDeps,
+        },
+        {
+          provide: PendingReferenceQueries,
+          useFactory: (uow: UnitOfWork, clock: Clock) => new PendingReferenceQueries(uow, clock),
+          inject: [UNIT_OF_WORK, CLOCK],
+        },
+        {
+          provide: PendingReferenceWorker,
+          useFactory: (resolve: ResolvePendingReference, queries: PendingReferenceQueries, metrics: Metrics) =>
+            new PendingReferenceWorker(resolve, queries, metrics, new NestStructuredLogger('PendingReferenceWorker'), {
+              enabled: pending.enabled,
+              batchSize: pending.batchSize,
+              concurrency: pending.concurrency,
+              pollIntervalMs: pending.pollIntervalMs,
+            }),
+          inject: [ResolvePendingReference, PendingReferenceQueries, METRICS],
         },
         {
           provide: PublishOutboxBatch,

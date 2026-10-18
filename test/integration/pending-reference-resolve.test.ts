@@ -1,7 +1,9 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { ResolvePendingReference } from '../../src/application/wagering/resolve-pending-reference';
 import { DEFAULT_PENDING_REFERENCE_POLICY } from '../../src/domain/pending-reference-policy';
-import { createWalletViaApi, startTestApp, submit, type TestApp, wagerPayload, type WalletBody } from './support/app';
+import {
+  CapturingLogger, createWalletViaApi, startTestApp, submit, type TestApp, wagerPayload, type WalletBody,
+} from './support/app';
 import { createTestOrm, type Sql, sqlRunner, walletsDivergingFromLedger } from './support/database';
 import { monetaryLeaks } from './support/logs';
 import { ManualClock } from './support/outbox';
@@ -21,12 +23,14 @@ let sql: Sql;
 let resolver: ResolvePendingReference;
 let closeOrm: () => Promise<void>;
 const clock = new ManualClock(new Date());
+/** Compartilhado pelos apps do arquivo: o logger do Nest é estático e iria para o último app criado. */
+const logs = new CapturingLogger();
 
 beforeAll(async () => {
   const orm = await createTestOrm();
   sql = sqlRunner(orm);
   closeOrm = () => orm.close(true);
-  api = await startTestApp({ clock });
+  api = await startTestApp({ clock, logger: logs });
   resolver = api.app.get(ResolvePendingReference);
 });
 
@@ -35,10 +39,10 @@ afterAll(async () => {
   await closeOrm?.();
 });
 
-beforeEach(() => api.logger.clear());
+beforeEach(() => logs.clear());
 
 afterEach(async () => {
-  expect(monetaryLeaks(api.logger.entries)).toEqual([]);
+  expect(monetaryLeaks(logs.entries)).toEqual([]);
   expect(await walletsDivergingFromLedger(sql)).toEqual([]);
 });
 
@@ -144,7 +148,7 @@ describe('expiration by TTL', () => {
 
 describe('expiration by attempts, with the TTL still far', () => {
   test('maxAttempts = 3: two attempts are rescheduled, the third expires', async () => {
-    const strict = await startTestApp({ clock, pendingReference: { maxAttempts: 3 } });
+    const strict = await startTestApp({ clock, logger: logs, pendingReference: { maxAttempts: 3 } });
     try {
       const strictResolver = strict.app.get(ResolvePendingReference);
       const w = await createWalletViaApi(strict, '100.00');

@@ -75,8 +75,8 @@ Uma transação para uma `walletId` que não existe **não é persistida**. A FK
 |---|---|---|
 | `INSUFFICIENT_FUNDS` | REJECTED | BET maior que o saldo |
 | `REVERSAL_WOULD_OVERDRAW` | REJECTED | reversão deixaria o saldo negativo |
-| `REFERENCE_NOT_FOUND` | REJECTED | referência não apareceu dentro do limite de tentativas |
-| `REFERENCE_NOT_PROCESSED` | REJECTED | a referência existe, mas terminou `REJECTED` ou `FAILED`: não há efeito a reverter |
+| `REFERENCE_NOT_FOUND` | REJECTED | a referência não apareceu até o fim do prazo da espera (TTL ou limite de tentativas; seção 8.3) |
+| `REFERENCE_NOT_PROCESSED` | REJECTED | referência **conhecida mas não aplicada**: terminou `REJECTED` ou `FAILED`, ou ainda estava pendente quando o prazo da reversão acabou (8.3). Não há efeito a reverter |
 | `REFERENCE_MISMATCH` | REJECTED | referência de outro player, wallet, moeda ou rodada |
 | `ALREADY_REVERSED` | REJECTED | referência já revertida (por REFUND ou ROLLBACK) |
 | `AMOUNT_MISMATCH` | REJECTED | valor diferente do da referência |
@@ -199,14 +199,14 @@ Tudo acontece na transação da submissão, com a wallet já travada, antes do I
 - **Referência de outro provider** nunca é encontrada, pelo mesmo motivo: fica pendente até o limite.
 - **WIN e LOSS com `referenceExternalTransactionId`: só informativo.** O campo é guardado e entra no hash, mas nunca é resolvido (`reference_transaction_id` fica NULL) e nunca deixa a transação pendente. Um WIN não deve esperar a BET para creditar, e o enunciado diz só que ele "pode referenciar".
 - **O replay reflete o estado atual.** A resposta do replay vem da linha gravada: 202 enquanto a reversão está pendente e, depois de resolvida, o resultado final (200 ou 422), com o saldo observado no momento da resolução. É a mesma resposta que o provedor receberia se tivesse chegado depois da resolução.
-- **Latência até o próximo ciclo do worker.** Quando a referência chega, a reversão pendente **não** é resolvida na mesma requisição: ela espera o próximo ciclo do worker (fatia 8), limitado por `next_attempt_at`. Resolver em linha deixaria o caminho da submissão mais complexo e duplicaria o worker; o custo é a reversão ficar visível como pendente por até um intervalo de backoff.
+- **Latência até o próximo ciclo do worker.** Quando a referência chega, a reversão pendente **não** é resolvida na mesma requisição: ela espera o próximo ciclo do worker (seção 8), limitado por `next_attempt_at`. Resolver em linha deixaria o caminho da submissão mais complexo e duplicaria o worker; o custo é a reversão ficar visível como pendente por até um intervalo de backoff (até 5 min). A melhoria que encurta isso está em 8.7.
 
 ### 5.11 `ResolvePendingReference` e a ordem de locks
-Use case que reavalia **uma** transação `PENDING_REFERENCE`. É o núcleo do worker da fatia 8, que vai acrescentar o agendamento, o `SKIP LOCKED` e o limite de tentativas. Uma transação SQL:
+Use case que reavalia **uma** transação `PENDING_REFERENCE`. O worker da seção 8 o chama para cada pendente vencida. Uma transação SQL:
 1. lê a linha **sem lock**, só para descobrir o `walletId` (imutável);
 2. `SELECT ... FOR UPDATE` na wallet;
-3. **relê a linha sob o lock** e termina como **no-op** se ela já não está `PENDING_REFERENCE` (outra instância resolveu antes);
-4. aplica as mesmas regras da submissão (5.10) e faz `UPDATE ... WHERE id = ? AND status = 'PENDING_REFERENCE'`, mais ledger, saldo e outbox, na mesma transação. Os eventos são os mesmos do caminho normal (`WagerTransactionProcessed` ou `Rejected`, e `WalletBalanceChanged` se o saldo mudou). Se a referência continua ausente, só conta a tentativa (`attempts + 1`, `next_attempt_at = now + backoff(attempts + 1)`), sem evento.
+3. **relê a linha sob o lock** e termina como **no-op** se ela já não está `PENDING_REFERENCE` (`not_pending`: outra instância resolveu antes) ou se o `next_attempt_at` ainda está no futuro (`not_due`: outra instância já contou esta tentativa; 8.1);
+4. aplica as mesmas regras da submissão (5.10) e faz `UPDATE ... WHERE id = ? AND status = 'PENDING_REFERENCE'`, mais ledger, saldo e outbox, na mesma transação. Os eventos são os mesmos do caminho normal (`WagerTransactionProcessed` ou `Rejected`, e `WalletBalanceChanged` se o saldo mudou). Se a referência continua inutilizável, ou conta a tentativa e reagenda (8.2), sem evento, ou, com o prazo esgotado, rejeita (8.3).
 
 O UPDATE confere as linhas afetadas, e algo diferente de 1 lança erro e desfaz a transação. Esse erro é só para o caso impossível: a releitura sob o lock já garantiu que a linha está pendente. Uma corrida entre dois resolves termina com um aplicando e o outro em no-op, sem erro (teste `reversal-concurrency.test.ts`).
 
@@ -337,7 +337,7 @@ REJECTED é erro de **negócio**: é um resultado persistido e idempotente, e re
 
 **Visibilidade ≥ `lock_timeout` + margem.** `SQS_CONSUMER_VISIBILITY_TIMEOUT_S` (default 30) é a visibilidade pedida no `ReceiveMessage`. A configuração recusa um valor menor que `DB_LOCK_TIMEOUT_MS` + 5 s (`CONSUMER_PROCESSING_MARGIN_MS`): o pior caso de uma mensagem é esperar o lock da wallet até o timeout, e a mensagem não pode reaparecer para outra instância enquanto a primeira ainda trabalha nela. Mesmo assim, se reaparecer, a inbox resolve (7.2). Pelo mesmo motivo, antes de **começar** cada mensagem o consumidor confere o prazo: se faltar menos que esse orçamento para a visibilidade acabar (mensagens no fim de um grupo longo), devolve a mensagem (`released_total{reason=lease_expiring}`) em vez de começar.
 
-**Concorrência abaixo do pool.** `SQS_CONSUMER_CONCURRENCY` (default 10) é o número de mensagens processadas em paralelo por instância. Cada uma segura uma conexão durante a transação. A configuração recusa `concorrência + 1 (publisher da outbox, se ligado) >= DB_POOL_MAX`, para que sempre sobre conexão para o HTTP e o health check.
+**Concorrência abaixo do pool.** `SQS_CONSUMER_CONCURRENCY` (default 10) é o número de mensagens processadas em paralelo por instância. Cada uma segura uma conexão durante a transação. Ela entra no orçamento do pool junto com o publisher e o worker de pendentes, com 5 conexões reservadas para o HTTP (8.5).
 
 ### 7.5 Lote, grupos e ordem
 O long polling (`WaitTimeSeconds` 20, até 10 mensagens) devolve um lote que pode ter vários `MessageGroupId`. O lote é dividido por grupo: **grupos em paralelo** (até a concorrência) e **mensagens do mesmo grupo em sequência**. Se uma mensagem fica para retry, as seguintes do mesmo grupo são devolvidas com visibilidade 0 (`released_total{reason=group_on_hold}`). O FIFO não entrega mensagens de um grupo enquanto outra do mesmo grupo está em voo, então elas voltam **depois** da que falhou.
@@ -371,3 +371,64 @@ Testes (Postgres e LocalStack reais, com fila e DLQ temporárias criadas por tes
 - `sqs-consumer.test.ts`: checagem do redrive; a mesma mensagem entregue 10 vezes (com `MessageDeduplicationId` diferentes, senão o próprio FIFO descartaria as cópias); `messageId` novo para a mesma transação (`level=idempotency`); HTTP e depois SQS é replay; mensagens venenosas (JSON inválido, tipo desconhecido, OPENING, wallet inexistente, `messageId` repetido com outro payload, mesma key com outro payload, mesmo `externalTransactionId` com outra key) vão para a DLQ com motivo e o mesmo grupo, sem segurar a BET seguinte da wallet; `55P03` por lock externo é reprocessado e aplicado uma vez; falha transitória e erro inesperado persistentes vão para a DLQ no limite, e a BET atrás deles no mesmo grupo é processada; REFUND antes da BET; shutdown que devolve as não iniciadas na hora e conclui a em andamento;
 - `sqs-consumer-crash.test.ts`: processo filho morto depois do commit e antes do ack; a redelivery é duplicata;
 - `sqs-consumer-concurrency.test.ts`: três processos consumindo a mesma fila e a mesma wallet, com `MessageGroupId` diferente por mensagem, 40 apostas mais 20 redeliveries e 5 replays em ordem embaralhada (exatamente 20 PROCESSED, 20 REJECTED, saldo 0.00, versão 21, nada na DLQ); e 20 rodadas de duas execuções simultâneas do use case com o mesmo `messageId` (um efeito, uma duplicata, nenhuma exceção).
+
+## 8. Worker de PENDING_REFERENCE
+
+### 8.1 Listar sem lock, decidir sob o lock da wallet
+Cada instância roda um `PendingReferenceWorker` (desligável com `PENDING_REFERENCE_WORKER_ENABLED=false`). Cada ciclo (`runOnce`):
+1. lista as vencidas numa transação curta: `SELECT id ... WHERE status = 'PENDING_REFERENCE' AND next_attempt_at <= $now ORDER BY next_attempt_at, id LIMIT $batch`, **sem** `FOR UPDATE` e **sem** `SKIP LOCKED` (usa o índice parcial `wt_pending_reference_due_idx`);
+2. chama o `ResolvePendingReference` (5.11) para cada id, com no máximo `PENDING_REFERENCE_CONCURRENCY` em paralelo.
+
+**Por que não `SKIP LOCKED` como no publisher.** Travar a linha da transação antes da wallet inverte a ordem de locks (5.11): a submissão faz wallet → transação, e o worker faria transação → wallet, reabrindo o deadlock de 5.1. Reservar as linhas numa transação separada exigiria uma coluna de lease e a recuperação de leases vencidas. Em vez disso, a listagem pode repetir linhas entre instâncias, e quem decide é o resolve, sob o lock da wallet.
+
+**Um único incremento por vencimento.** Duas instâncias listam a mesma linha vencida e chamam o resolve. As duas fazem fila no `FOR UPDATE` da wallet. A primeira decide: resolve, expira ou conta a tentativa e move `next_attempt_at` para o futuro. A segunda, ao reler a linha sob o lock, vê `status` diferente (`not_pending`) ou `next_attempt_at > now` (`not_due`) e termina sem escrever nada. O `now` é lido **depois** de obter o lock, então quem esperou na fila compara com o relógio atual. O custo de uma listagem repetida é uma espera de lock e uma releitura, nunca uma escrita. Testes: dois resolves simultâneos na mesma pendente (`pending-reference-resolve.test.ts`) e dois workers em apps separados, cada um com seu pool, por 10 rodadas (`pending-reference-worker.test.ts`); em ambos `attempts` sobe exatamente 1.
+
+### 8.2 Cronograma de `next_attempt_at`
+`attempts` conta as tentativas de resolução que falharam e foram reagendadas. A submissão agenda `createdAt + backoff(1)`; depois da k-ésima tentativa, `now + backoff(k + 1)`. Assim nenhum degrau é pulado: 1 s, 2 s, 4 s, ... até o teto de 5 min (`PENDING_REFERENCE_BACKOFF_BASE_MS` e `_MAX_MS`). A mesma `PendingReferencePolicy` é injetada na submissão e no resolve, e as datas vêm do `Clock` da aplicação (mesma regra de 6.2). O agendamento **nunca passa de `createdAt + TTL`**: sem esse teto, a expiração poderia atrasar um degrau inteiro. Sem jitter, como em 4.6. O cronograma está em `src/domain/pending-reference-policy.ts` e tem teste de unidade.
+
+### 8.3 Prazo: TTL e tentativas
+A espera termina no que vier primeiro:
+- **TTL a partir de `created_at`**, default 1 h (`PENDING_REFERENCE_TTL_MS`). Uma reversão chega antes da referência quando há reordenação: grupos diferentes ou retries na fila de entrada (o consumidor tenta 5 vezes com backoff de até 60 s, 7.4), retry de HTTP do provedor, ou instâncias em paralelo. Tudo isso se resolve em minutos. 1 h cobre esses atrasos com folga e ainda limita quanto tempo o provedor espera por uma resposta definitiva. Uma referência que demora mais que isso indica falha operacional (fila parada, mensagem na DLQ), e a reversão rejeitada fica auditável.
+- **Limite de tentativas**, default 30 (`PENDING_REFERENCE_MAX_ATTEMPTS`), a rede de segurança. Com o backoff padrão, 1 h dá cerca de 20 tentativas (9 degraus somam ~8,5 min, depois um a cada 5 min), então quem decide é o TTL. As tentativas só pesam se o backoff for configurado pequeno, e nesse caso encerram a espera antes do TTL. Quem reduzir o backoff deve aumentar o limite junto.
+
+**Resolver vem antes de expirar.** Na última tentativa, o resolve aplica as regras normalmente; só se a referência continuar inutilizável é que a transação expira. Uma referência que chegou no fim do prazo ainda é aplicada (teste em `pending-reference-resolve.test.ts`).
+
+**Código da expiração.**
+- Referência ausente: `REFERENCE_NOT_FOUND`.
+- Referência encontrada mas ainda não aplicada (`PENDING` ou `PENDING_REFERENCE`): `REFERENCE_NOT_PROCESSED`, com `reference_transaction_id` apontando para ela. O código significa "referência conhecida mas não aplicada" (seção 3), o mesmo de quando a referência termina `REJECTED`.
+
+Isso torna o resultado **independente da ordem de avaliação**. Exemplo: um ROLLBACK de um REFUND, e o REFUND espera uma BET que nunca chega. Se o worker avalia o REFUND primeiro, ele expira com `REFERENCE_NOT_FOUND`, e o ROLLBACK depois vê um REFUND `REJECTED` e recebe `REFERENCE_NOT_PROCESSED` pela regra normal. Se avalia o ROLLBACK primeiro, ele expira vendo o REFUND ainda pendente e recebe o mesmo `REFERENCE_NOT_PROCESSED`. Nas duas ordens, o mesmo estado final e nenhum efeito financeiro (teste com as duas ordens). A identidade da referência já foi conferida antes (4.4), então o vínculo é sempre com uma transação da mesma wallet.
+
+**Efeitos.** A expiração é uma rejeição como qualquer outra: `balance_after` = saldo da wallet lido sob o lock, nenhum lançamento, `WagerTransactionRejected` na outbox na mesma transação, e o replay devolve 422 com esse resultado. Ela também encerra o ROLLBACK da OPENING e as referências de outro provider (5.10), que nunca são encontradas.
+
+**Limitação.** Depois de uma rejeição por prazo, a reversão está encerrada. Se a referência aparecer depois (por exemplo, reenviada da DLQ), o provedor precisa mandar a reversão com **novo `externalTransactionId` e nova `Idempotency-Key`**. A mesma key é replay (devolve o 422), e o mesmo `externalTransactionId` com outra key é `409 EXTERNAL_TRANSACTION_ID_CONFLICT` pela `UNIQUE (provider_id, external_transaction_id)` (5.4).
+
+### 8.4 Laço, falhas e linha venenosa
+O ciclo seguinte roda **na hora só se o lote veio cheio e nenhum item falhou**; caso contrário, espera `PENDING_REFERENCE_POLL_INTERVAL_MS` (default 1 s), num sono interrompível.
+
+**Falha num item.** O resolve é desfeito por inteiro, sem contar a tentativa, e a linha continua vencida para o próximo ciclo. `lock_timeout` (`55P03`) e outras falhas transitórias geram log `warn`; erro inesperado gera log `error`. Os campos são `transactionId`, nome do erro, SQLSTATE e, no inesperado, só os frames do stack (mesmo critério de 7.3). Contador: `pending_reference_errors_total{reason}`, com o SQLSTATE quando houver. Falha na listagem: `pending_reference_cycle_errors_total`, e o laço espera e continua.
+
+**Linha venenosa.** Uma linha cujo resolve falha sempre (bug, dado corrompido) nunca tem `attempts` incrementado e nunca expira, porque a checagem de prazo roda dentro da transação que falha. Ela fica vencida para sempre e, pelo `ORDER BY next_attempt_at`, volta no início de toda listagem. Consequências:
+- um log `error` e um incremento de métrica por ciclo, que servem de alerta;
+- ela ocupa uma vaga do lote;
+- a regra acima (só repetir na hora se nada falhou) impede que ela vire um laço quente.
+
+Se houver `PENDING_REFERENCE_BATCH_SIZE` linhas venenosas, elas ocupam o lote inteiro e as demais pendentes deixam de ser atendidas até a correção. Para evitar isso, seria preciso registrar a falha numa transação separada (contador de erros e `next_attempt_at` empurrado) ou levar a linha a `FAILED` com `INTERNAL_ERROR` depois de N erros. Ficou de fora: essa escrita aconteceria fora do lock da wallet (ou exigiria travá-la de novo numa segunda transação), contrariando a regra de 5.11 de que todo UPDATE em `wager_transactions` acontece sob o lock da wallet.
+
+### 8.5 Orçamento do pool
+Cada resolve em andamento segura uma conexão, assim como cada mensagem do consumidor e o lote do publisher. A configuração exige `SQS_CONSUMER_CONCURRENCY + 1 (publisher) + PENDING_REFERENCE_CONCURRENCY <= DB_POOL_MAX - 5`, contando só os workers ligados. Com os defaults: 10 + 1 + 4 = 15 = 20 − 5. As 5 conexões (`HTTP_RESERVED_CONNECTIONS`) ficam para o HTTP e o health check, mesmo com todos os workers saturados (por exemplo, todos esperando locks). É um piso, não um dimensionamento: com carga HTTP alta, o certo é aumentar `DB_POOL_MAX`. O `lock_timeout` de 5.5 vale também para o resolve.
+
+### 8.6 Shutdown, métricas e testes
+**Shutdown.** O `stop()` roda no `beforeApplicationShutdown` (`app.close()` ou SIGTERM), antes de o pool fechar. Ele para de listar, impede que as filas de trabalho comecem linhas novas e espera os resolves em andamento chegarem ao commit. As linhas já listadas e não iniciadas continuam vencidas no banco para a próxima instância.
+
+**Métricas** (porta `Metrics`): `pending_reference_resolved_total{status}`, `pending_reference_expired_total{failureCode}`, `pending_reference_retries_total`, `pending_reference_noop_total{reason}`, `pending_reference_errors_total{reason}`, `pending_reference_cycle_errors_total` e `pending_reference_resolve_seconds`. Ao fim de cada ciclo: os gauges `pending_reference_pending` (quantas estão pendentes) e `pending_reference_oldest_age_seconds` (`now − min(created_at)`, zero quando não há nenhuma).
+
+**Testes** (Postgres e LocalStack reais, relógio manual; todos terminam com `saldo == ledger` e com um `afterEach` que falha se algum log trouxer valor monetário):
+- unidade: cronograma (`backoff(1)` na submissão, sem pular degrau, nunca além do prazo, expiração exatamente no prazo), expiração por tentativas com o TTL longe, códigos da expiração, orçamento do pool;
+- `pending-reference-resolve.test.ts`: `not_due` antes do vencimento; dois resolves simultâneos com um único incremento; TTL esgotado com o saldo observado sob o lock, o evento na outbox e o replay 422; referência que chega no fim do prazo é aplicada; `maxAttempts = 3` expira na terceira tentativa, 15 min depois da criação; cadeia sem a BET nas duas ordens de avaliação;
+- `pending-reference-worker.test.ts`: reversão resolvida quando a referência chega, com os eventos lidos de uma fila FIFO no LocalStack; dois workers em apps separados; TTL esgotado com o `Rejected` na outbox e depois na fila; cadeia ROLLBACK de REFUND que espera a BET convergindo em até dois ciclos; reinício (uma instância conta a tentativa e para, outra resolve); shutdown com o resolve bloqueado num lock externo (o `app.close()` só termina depois do commit, e a segunda linha listada não é iniciada).
+
+**Nota de teste.** O logger do Nest é estático: os `new Logger(...)` escrevem no logger do **último** app criado. Os testes que sobem vários apps passam um `CapturingLogger` compartilhado, para que a checagem de valores monetários veja todas as entradas.
+
+### 8.7 Melhoria futura: acordar pendentes quando a referência chega
+Hoje a reversão espera o próximo vencimento depois que a referência chega, o que leva até um degrau de backoff (5.10). A melhoria: quando a submissão processa uma transação, na mesma transação e sob o mesmo lock da wallet, fazer `UPDATE wager_transactions SET next_attempt_at = $now WHERE status = 'PENDING_REFERENCE' AND wallet_id = $wallet AND provider_id = $provider AND reference_external_transaction_id = $external`. O filtro por `wallet_id` mantém a regra de 5.11 (só mexe em linhas da wallet travada), e precisaria de um índice parcial por `(provider_id, reference_external_transaction_id) WHERE status = 'PENDING_REFERENCE'`. Isso só antecipa o vencimento, sem resolver em linha, e o worker continua sendo o único caminho de resolução. Combinado com um `NOTIFY` para acordar o laço, a latência cairia para milissegundos. Ficou de fora por escopo.

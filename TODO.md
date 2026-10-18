@@ -62,6 +62,14 @@ Decisões em ARCHITECTURE.md, seção 7. Os dois lembretes antigos desta fatia (
 - [ ] Índice parcial `(occurred_at) WHERE published_at IS NULL` para o `min(occurred_at)` da métrica de outbox lag, que hoje percorre todas as pendentes
 - [ ] ARCHITECTURE: retenção das linhas publicadas da outbox e da inbox (limpeza periódica); relógio (o `Clock` de cada instância grava `next_attempt_at`, e uma instância com relógio adiantado antecipa retries); evento envenenado (erro do remetente fica em retry para sempre, só com alerta)
 
-## Fatia 8 (lembrete para o worker)
-- [ ] Respeitar a ordem de locks de 5.11: nunca travar `wager_transactions` antes da wallet
-- [ ] Limite de tentativas ou TTL → `REJECTED` `REFERENCE_NOT_FOUND` + evento (também encerra ROLLBACK de OPENING e referências de outro provider)
+## Fatia 8: worker de PENDING_REFERENCE (concluída)
+
+Decisões em ARCHITECTURE.md, seção 8 (e 3, 5.10, 5.11).
+
+- [x] Ordem de locks de 5.11: listagem sem lock; o resolve trava a wallet e relê (`not_pending`, `not_due`)
+- [x] Política no domínio: TTL de 1 h a partir de `created_at`, 30 tentativas, backoff injetado; `next_attempt_at` sem pular degrau e nunca além do prazo
+- [x] Expiração: resolver antes de expirar; `REFERENCE_NOT_FOUND` (ausente) ou `REFERENCE_NOT_PROCESSED` com vínculo (conhecida, não aplicada); saldo sob o lock e `Rejected` na outbox
+- [x] Worker com concorrência limitada; repete na hora só com lote cheio e sem falha; linha venenosa documentada; shutdown via `app.close()`
+- [x] Orçamento do pool: workers somados ≤ `DB_POOL_MAX` − 5
+- [x] Métricas: resolvidas, expiradas, retries, no-ops, erros, pendentes e idade da mais antiga
+- [x] Testes: unidade (cronograma, tentativas, configuração), resolve (corrida, TTL, tentativas, cadeia nas duas ordens) e worker (referência chega, dois workers, TTL até o SQS, cadeia, reinício, shutdown), com `afterEach` de valores monetários em log
