@@ -11,6 +11,10 @@ import { PendingReferenceQueries } from './application/wagering/pending-referenc
 import { ResolvePendingReference } from './application/wagering/resolve-pending-reference';
 import { SubmitWagerTransaction } from './application/wagering/submit-wager-transaction';
 import { CreateWallet } from './application/wallets/create-wallet';
+import { GetLedgerPage } from './application/wallets/get-ledger-page';
+import { GetWallet } from './application/wallets/get-wallet';
+import { WALLET_QUERIES, type WalletQueries } from './application/ports/wallet-queries';
+import { SqlWalletQueries } from './infrastructure/persistence/sql-wallet-queries';
 import { MESSAGE_QUEUE, type MessageQueue } from './application/ports/message-queue';
 import {
   CONSUMER_NAME,
@@ -19,6 +23,9 @@ import {
   consumerSettingsFromEnv,
   type DatabaseSettings,
   databaseSettingsFromEnv,
+  type LedgerSettings,
+  ledgerSettingsFromEnv,
+  validateLedgerSettings,
   type OutboxSettings,
   outboxSettingsFromEnv,
   type PendingReferenceSettings,
@@ -54,6 +61,7 @@ export interface AppOptions {
   outbox?: Partial<OutboxSettings>;
   consumer?: Partial<ConsumerSettings>;
   pendingReference?: Partial<PendingReferenceSettings>;
+  ledger?: Partial<LedgerSettings>;
   idGenerator?: IdGenerator;
   clock?: Clock;
   eventPublisher?: EventPublisher;
@@ -77,6 +85,8 @@ export class AppModule {
     if (consumer.enabled) validateConsumerSettings(consumer, database);
     const pending = { ...pendingReferenceSettingsFromEnv(), ...options.pendingReference };
     validatePendingReferenceSettings(pending);
+    const ledger = { ...ledgerSettingsFromEnv(), ...options.ledger };
+    validateLedgerSettings(ledger);
     validatePoolBudget(database, {
       consumerConcurrency: consumer.enabled ? consumer.concurrency : 0,
       outboxPublishers: outbox.enabled ? 1 : 0,
@@ -105,6 +115,17 @@ export class AppModule {
           provide: UNIT_OF_WORK,
           useFactory: (orm: MikroORM) => new MikroOrmUnitOfWork(orm, database.lockTimeoutMs),
           inject: [MikroORM],
+        },
+        {
+          provide: WALLET_QUERIES,
+          useFactory: (orm: MikroORM) => new SqlWalletQueries(orm),
+          inject: [MikroORM],
+        },
+        { provide: GetWallet, useFactory: (q: WalletQueries) => new GetWallet(q), inject: [WALLET_QUERIES] },
+        {
+          provide: GetLedgerPage,
+          useFactory: (q: WalletQueries) => new GetLedgerPage(q, ledger),
+          inject: [WALLET_QUERIES],
         },
         {
           provide: CreateWallet,

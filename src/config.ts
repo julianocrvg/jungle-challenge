@@ -245,3 +245,25 @@ function positiveInteger(env: Record<string, string | undefined>, name: string, 
   }
   return Number.parseInt(raw, 10);
 }
+
+/** Paginação do ledger (ARCHITECTURE 9.2). */
+export interface LedgerSettings {
+  defaultPageSize: number;
+  maxPageSize: number;
+}
+
+export const DEFAULT_LEDGER_PAGE_SIZE = 50;
+export const DEFAULT_LEDGER_MAX_PAGE_SIZE = 100;
+
+export function ledgerSettingsFromEnv(env: Record<string, string | undefined> = process.env): LedgerSettings {
+  return {
+    defaultPageSize: positiveInteger(env, 'LEDGER_DEFAULT_PAGE_SIZE', DEFAULT_LEDGER_PAGE_SIZE),
+    maxPageSize: positiveInteger(env, 'LEDGER_MAX_PAGE_SIZE', DEFAULT_LEDGER_MAX_PAGE_SIZE),
+  };
+}
+
+export function validateLedgerSettings(settings: LedgerSettings): void {
+  if (settings.defaultPageSize > settings.maxPageSize) {
+    throw new Error('LEDGER_DEFAULT_PAGE_SIZE must not exceed LEDGER_MAX_PAGE_SIZE');
+  }
+}

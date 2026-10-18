@@ -432,3 +432,16 @@ Cada resolve em andamento segura uma conexão, assim como cada mensagem do consu
 
 ### 8.7 Melhoria futura: acordar pendentes quando a referência chega
 Hoje a reversão espera o próximo vencimento depois que a referência chega, o que leva até um degrau de backoff (5.10). A melhoria: quando a submissão processa uma transação, na mesma transação e sob o mesmo lock da wallet, fazer `UPDATE wager_transactions SET next_attempt_at = $now WHERE status = 'PENDING_REFERENCE' AND wallet_id = $wallet AND provider_id = $provider AND reference_external_transaction_id = $external`. O filtro por `wallet_id` mantém a regra de 5.11 (só mexe em linhas da wallet travada), e precisaria de um índice parcial por `(provider_id, reference_external_transaction_id) WHERE status = 'PENDING_REFERENCE'`. Isso só antecipa o vencimento, sem resolver em linha, e o worker continua sendo o único caminho de resolução. Combinado com um `NOTIFY` para acordar o laço, a latência cairia para milissegundos. Ficou de fora por escopo.
+
+## 9. Consultas e reconciliação
+
+### 9.1 Leituras fora da UnitOfWork de escrita
+As consultas de wallet e ledger passam pela porta `WalletQueries` (`SqlWalletQueries`), em SQL explícito, **sem transação de escrita e sem nenhum lock**. Leitura não pode competir com o `FOR UPDATE` da submissão: a unidade de concorrência continua sendo a linha da wallet, e quem só lê nunca a segura. Dinheiro sai como `::text` e viaja como `{amount, currency}`, sem passar pelo domínio (uma consulta não aplica regra, e a `difference` da reconciliação pode ser negativa, o que `Money.from` recusa). A moeda de cada valor vem da wallet. Todos os endpoints de consulta usam o `AuthGuard` no-op (ponto de extensão de autenticação).
+
+### 9.2 Ledger paginado por cursor opaco
+`GET /wallets/:walletId/ledger?cursor=&limit=` devolve `{entries, nextCursor}`, ordenado por `wallet_version`.
+- **Cursor:** `base64url` da `wallet_version` do último lançamento da página. A decodificação é estrita e exige o round-trip exato: padding (`=`), prefixos (`v:2`), zero, negativos, decimais, notação científica e valores acima de `INTEGER` dão `400 INVALID_CURSOR`. Cursor válido para wallet inexistente dá 404.
+- **Limite:** `LEDGER_DEFAULT_PAGE_SIZE` (50) e `LEDGER_MAX_PAGE_SIZE` (100). `limit` não inteiro, zero, negativo ou acima do máximo dá `400 INVALID_LIMIT`, em vez de ser ajustado em silêncio (o cliente não pensa que recebeu a página inteira).
+- **Fim da lista:** a query pede `limit + 1` linhas; a linha extra só indica que há próxima página (sem `COUNT`). Na última página `nextCursor` é `null`, inclusive quando o total é múltiplo exato do limite.
+- **Por que é estável durante escrita concorrente.** A `wallet_version` de um lançamento é atribuída sob o `FOR UPDATE` da wallet, que só cai no commit. A versão N+1 só pode ser calculada depois do commit da N. Logo nenhuma versão menor que o cursor aparece depois que ele foi emitido: sem entrada repetida e sem entrada perdida. `created_at` não serviria (empata e não é ordenado pelo commit).
+- Wallet sem lançamentos: `entries: []` e `nextCursor: null` (um `LEFT JOIN` distingue isso de wallet inexistente numa só instrução).

@@ -142,3 +142,15 @@ const CORRELATION_ID = /^[\x21-\x7E]{1,128}$/;
 export function correlationIdFrom(header: unknown, generate: () => string): string {
   return typeof header === 'string' && CORRELATION_ID.test(header) ? header : generate();
 }
+
+/** Parâmetro de rota que precisa ser UUID (walletId, transactionId). */
+export function parseUuidParam(value: unknown, name: string): string {
+  if (typeof value !== 'string' || !UUID.test(value)) throw new RequestValidationError([`${name} must be a UUID`]);
+  return value.toLowerCase();
+}
+
+/** Parâmetro de rota livre do provedor (providerId, externalTransactionId): mesma regra do payload. */
+export function parseIdentifierParam(value: unknown, name: string): string {
+  const c = new Checker();
+  return c.done(c.text(value, name) as string);
+}

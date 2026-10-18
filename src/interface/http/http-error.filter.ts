@@ -3,6 +3,9 @@ import {
   ExternalTransactionIdConflictError,
   IdempotencyKeyConflictError,
   InvalidCommandError,
+  InvalidCursorError,
+  InvalidLimitError,
+  TransactionNotFoundError,
   TransientInfrastructureError,
   WalletAlreadyExistsError,
   WalletNotFoundError,
@@ -42,7 +45,8 @@ export function toHttpError(error: unknown): HttpError {
 
   if (error instanceof RequestValidationError) return of(400, error, error.details);
   if (error instanceof InvalidCommandError) return of(400, error, [error.message]);
-  if (error instanceof WalletNotFoundError) return of(404, error);
+  if (error instanceof InvalidCursorError || error instanceof InvalidLimitError) return of(400, error);
+  if (error instanceof WalletNotFoundError || error instanceof TransactionNotFoundError) return of(404, error);
   if (
     error instanceof IdempotencyKeyConflictError ||
     error instanceof ExternalTransactionIdConflictError ||

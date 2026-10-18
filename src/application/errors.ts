@@ -43,3 +43,18 @@ export class InboxMessageConflictError extends ApplicationError {
 export class TransientInfrastructureError extends ApplicationError {
   readonly code = 'SERVICE_UNAVAILABLE';
 }
+
+/** Transação inexistente numa consulta (nada é persistido por uma consulta). */
+export class TransactionNotFoundError extends ApplicationError {
+  readonly code = 'TRANSACTION_NOT_FOUND';
+}
+
+/** Cursor do ledger que não é um dos que a API emite (ARCHITECTURE 9.2). */
+export class InvalidCursorError extends ApplicationError {
+  readonly code = 'INVALID_CURSOR';
+}
+
+/** `limit` do ledger fora de 1..máximo configurado. */
+export class InvalidLimitError extends ApplicationError {
+  readonly code = 'INVALID_LIMIT';
+}
