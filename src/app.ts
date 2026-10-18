@@ -13,7 +13,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<INestAp
   const { logger, ...appOptions } = options;
   const app = await NestFactory.create(AppModule.forRoot(appOptions), logger === undefined ? {} : { logger });
   app.useGlobalFilters(new HttpErrorFilter());
-  // Fecha o pool do ORM (e, nas próximas fatias, o consumidor SQS) ao receber SIGTERM.
+  // SIGTERM: o publisher da outbox conclui o lote em andamento, depois o pool do ORM fecha (ARCHITECTURE 6.5).
   app.enableShutdownHooks();
   return app;
 }

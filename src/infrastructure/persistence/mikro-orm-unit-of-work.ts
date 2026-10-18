@@ -1,7 +1,7 @@
 import type { MikroORM } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/postgresql';
 import { TransientInfrastructureError } from '../../application/errors';
-import type { TransactionalRepositories, UnitOfWork } from '../../application/ports/unit-of-work';
+import type { TransactionalRepositories, TransactionOptions, UnitOfWork } from '../../application/ports/unit-of-work';
 import { isTransientDatabaseError } from './database-errors';
 import { sqlRepositories } from './sql-repositories';
 
@@ -20,10 +20,17 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
     }
   }
 
-  async run<T>(work: (repositories: TransactionalRepositories) => Promise<T>): Promise<T> {
+  async run<T>(work: (repositories: TransactionalRepositories) => Promise<T>, options: TransactionOptions = {}): Promise<T> {
+    const idleTimeoutMs = options.idleInTransactionTimeoutMs;
+    if (idleTimeoutMs !== undefined && (!Number.isInteger(idleTimeoutMs) || idleTimeoutMs <= 0)) {
+      throw new Error('idleInTransactionTimeoutMs must be a positive integer');
+    }
     try {
       return await (this.orm.em.fork() as EntityManager).transactional(async (em) => {
         await em.execute(`SET LOCAL lock_timeout = '${this.lockTimeoutMs}ms'`);
+        if (idleTimeoutMs !== undefined) {
+          await em.execute(`SET LOCAL idle_in_transaction_session_timeout = '${idleTimeoutMs}ms'`);
+        }
         return work(sqlRepositories(em));
       });
     } catch (error) {

@@ -143,6 +143,10 @@ Postgres na porta 5433 porque há um PostgreSQL local na 5432. Testes usam o ban
 
 Variáveis do banco: `DATABASE_URL`, `DB_POOL_MAX` (default 20) e `DB_LOCK_TIMEOUT_MS` (default 10000, ARCHITECTURE 5.5).
 
+Variáveis do SQS: `SQS_ENDPOINT` (default `http://localhost:4566`), `AWS_REGION`, `SQS_EVENTS_QUEUE_URL` (default `wager-events.fifo`).
+Publisher da outbox (ARCHITECTURE 6): `OUTBOX_PUBLISHER_ENABLED` (default true), `OUTBOX_BATCH_SIZE` (default 10, máx. 10), `OUTBOX_POLL_INTERVAL_MS` (500), `OUTBOX_SEND_TIMEOUT_MS` (5000), `OUTBOX_IDLE_TX_TIMEOUT_MS` (default e mínimo `max(3 × send, 15000)`).
+Depois de mudar `docker/localstack/init-sqs.sh`: `docker compose up -d --force-recreate localstack`.
+
 Ajuste os scripts reais em `package.json` e mantenha esta seção atualizada.
 
 ## Ordem de implementação

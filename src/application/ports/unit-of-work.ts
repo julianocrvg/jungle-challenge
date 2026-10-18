@@ -38,6 +38,17 @@ export interface LedgerRepository {
 
 export interface OutboxRepository {
   append(messages: readonly OutboxMessage[]): Promise<void>;
+  /**
+   * `published_at IS NULL AND next_attempt_at <= now ... FOR UPDATE SKIP LOCKED`: trava até `limit` mensagens
+   * vencidas que nenhum outro publisher travou. `now` vem do Clock da aplicação, o mesmo que gravou as datas.
+   */
+  claimDue(now: Date, limit: number): Promise<OutboxMessage[]>;
+  /** Grava `published_at`. Só sob o lock de `claimDue`; lança se a linha já estava publicada. */
+  markPublished(message: OutboxMessage): Promise<void>;
+  /** Grava `attempts` e `next_attempt_at`. Só sob o lock de `claimDue`; lança se a linha já estava publicada. */
+  saveRetry(message: OutboxMessage): Promise<void>;
+  /** `occurred_at` do evento pendente mais antigo (base da métrica de outbox lag). */
+  oldestPendingOccurredAt(): Promise<Date | undefined>;
 }
 
 export interface TransactionalRepositories {
@@ -51,8 +62,16 @@ export interface TransactionalRepositories {
  * Uma transação SQL. Tudo o que `work` grava é confirmado junto ou desfeito junto. Falhas transitórias de
  * infraestrutura saem como TransientInfrastructureError.
  */
+export interface TransactionOptions {
+  /**
+   * `SET LOCAL idle_in_transaction_session_timeout`: para transações que esperam I/O externo com a sessão
+   * aberta (publisher da outbox, ARCHITECTURE 6.2). Se o processo travar, o Postgres derruba a sessão.
+   */
+  idleInTransactionTimeoutMs?: number;
+}
+
 export interface UnitOfWork {
-  run<T>(work: (repositories: TransactionalRepositories) => Promise<T>): Promise<T>;
+  run<T>(work: (repositories: TransactionalRepositories) => Promise<T>, options?: TransactionOptions): Promise<T>;
 }
 
 export const UNIT_OF_WORK = Symbol('UnitOfWork');

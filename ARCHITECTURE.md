@@ -205,3 +205,72 @@ Use case que reavalia **uma** transação `PENDING_REFERENCE`. É o núcleo do w
 O UPDATE confere as linhas afetadas, e algo diferente de 1 lança erro e desfaz a transação. Esse erro é só para o caso impossível: a releitura sob o lock já garantiu que a linha está pendente. Uma corrida entre dois resolves termina com um aplicando e o outro em no-op, sem erro (teste `reversal-concurrency.test.ts`).
 
 **Ordem de locks (regra do sistema): wallet primeiro, sempre.** Todo caminho que muda uma `wager_transaction` ou o saldo trava a linha da wallet **antes** de qualquer outro lock de linha. Isso vale para submissão, resolve e worker. O worker da fatia 8 **não pode** travar a linha da transação (por exemplo, com `FOR UPDATE SKIP LOCKED` em `wager_transactions`) e depois a wallet: a submissão faz wallet → transação, e a ordem invertida reabre o ciclo de deadlock de 5.1. O worker deve **selecionar candidatos sem segurar o lock da transação**, ou usar `SKIP LOCKED` só numa transação curta de "reserva" que termina antes de travar a wallet, e então chamar este use case, que trava na ordem certa. Pela mesma razão, todo UPDATE em `wager_transactions` acontece sob o lock da wallet, o que é a premissa da leitura sem lock em 5.10.
+
+## 6. Publisher da outbox
+
+### 6.1 Destino e atributos da mensagem
+Os eventos vão para a fila FIFO `wager-events.fifo`, criada no boot do LocalStack (`docker/localstack/init-sqs.sh`) com a DLQ `wager-events-dlq.fifo` (`maxReceiveCount` 5). A DLQ atende aos **consumidores** dos eventos; o publisher nunca manda nada para ela. Cada evento vira uma entrada do `SendMessageBatch`:
+- `MessageDeduplicationId` = `eventId` (o `id` da outbox): um reenvio do mesmo evento é descartado pelo FIFO;
+- `MessageGroupId` = `aggregateId`, que é a `walletId` (4.5). A ordem por wallet é **só otimização**;
+- corpo = envelope JSON do evento (`IntegrationEvent.toJSON()`, o mesmo gravado em `payload`), e `eventType` vai como atributo.
+
+O cliente do SDK tem `maxAttempts: 1`: o retry é o backoff da outbox, gravado no banco. Com retry também no SDK, a duração de uma chamada ficaria imprevisível e os dois retries se somariam.
+
+**Teste de fumaça (`outbox-sqs-dedup.test.ts`):** dois envios com o mesmo `MessageDeduplicationId` resultam em uma mensagem só no LocalStack 3.8, e o segundo envio volta como sucesso. Por isso os testes de crash e de concorrência exigem **cada `eventId` exatamente uma vez na fila**, e não só "nenhum perdido".
+
+### 6.2 Claim, envio e marcação na mesma transação
+Cada tick (`PublishOutboxBatch`) roda numa única transação:
+1. `SELECT ... WHERE published_at IS NULL AND next_attempt_at <= $now ORDER BY next_attempt_at, id LIMIT $n FOR UPDATE SKIP LOCKED`;
+2. `SendMessageBatch` com timeout;
+3. `published_at` nas entradas aceitas e `scheduleRetry` (`attempts + 1`, backoff) nas demais;
+4. commit.
+
+O `SKIP LOCKED` faz cada publisher pegar só linhas que nenhum outro travou, sem esperar e sem lock global. O lock dura até o commit, então uma linha nunca está em dois lotes ao mesmo tempo. Os `UPDATE` têm guarda `published_at IS NULL` e conferem que afetaram 1 linha.
+
+**Trade-off.** A conexão e o lock das linhas ficam presos durante a chamada ao SQS. O lock é só nas linhas da **outbox**: a submissão apenas faz INSERT nessa tabela e nunca trava uma linha pendente, então não é bloqueada. Para limitar o custo:
+- o lote tem no máximo 10 mensagens (`OUTBOX_BATCH_SIZE`, que é o limite do `SendMessageBatch`);
+- a chamada tem teto (`OUTBOX_SEND_TIMEOUT_MS`, default 5 s), aplicado pelo use case com `Promise.race` mais `AbortSignal`, de modo que não depende do adaptador respeitar o sinal;
+- cada instância roda um publisher, ou seja, usa uma conexão do pool.
+
+A alternativa de "reservar" em uma transação e marcar em outra (lease com `locked_until`) libera a conexão durante o envio, mas pede uma coluna a mais e uma recuperação de leases vencidas. Ficou de fora por complexidade.
+
+**`idle_in_transaction_session_timeout`.** É a rede de proteção para o caso de o processo travar com a transação aberta: o Postgres derruba a sessão e solta as linhas. Durante a chamada ao SQS a sessão está, por definição, **ociosa dentro da transação**, então esse timeout tem de ser bem maior que o de envio. Default: `max(3 × OUTBOX_SEND_TIMEOUT_MS, 15 s)` (`OUTBOX_IDLE_TX_TIMEOUT_MS`). A configuração recusa um valor menor. Ele é aplicado com `SET LOCAL`, então vale só para a transação do lote. O teste `outbox-publisher.test.ts` prova que um envio lento, ainda dentro do timeout, não derruba a sessão.
+
+**Relógio da aplicação.** O `$now` do claim vem do `Clock`, o mesmo relógio que gravou `occurred_at` e `next_attempt_at`. Os três use cases gravam `next_attempt_at = occurredAt = clock.now()` explicitamente no INSERT, e o `DEFAULT now()` da coluna nunca é usado (teste em `outbox-publisher.test.ts`). Assim o backoff é determinístico nos testes, e não há mistura entre o relógio do banco e o da aplicação.
+
+### 6.3 Entrega at-least-once e resultados ambíguos
+Nada é marcado antes do commit. Se o processo morre depois do envio e antes do commit, ou se o próprio commit falha, a transação é desfeita, a linha continua pendente e outro publisher a reenvia com o mesmo `eventId`.
+
+O FIFO deduplica dentro da janela de **5 minutos**. Depois dela, um reenvio pode gerar duplicata, e por isso **o consumidor tem de ser idempotente**: inbox por `eventId` e `walletVersion` para descartar estado antigo.
+
+**Timeout é resultado ambíguo**: o broker pode ter aceitado as mensagens e a resposta não chegou. O lote inteiro recebe retry, e a deduplicação resolve o caso.
+
+Uma exceção na chamada (rede, fila inexistente, credencial) também leva o lote inteiro para retry, com `outbox_publish_call_failures_total{reason=timeout|call_error}` e log `warn`.
+
+**Falha por entrada (falha parcial do `SendMessageBatch`).** O campo `SenderFault` separa dois casos:
+- **erro do remetente**: o broker recusou o que enviamos, o que indica bug. Recebe retry mesmo assim, para nunca descartar o evento, mas com log `error` e um contador próprio (`outbox_sender_faults_total{code}`) para gerar alerta;
+- **erro do serviço**: retry com log `warn`.
+
+Uma entrada que não aparece na resposta também recebe retry, e nunca é tratada como publicada.
+
+### 6.4 Retry sem limite e reordenação
+O retry não tem limite de tentativas. O backoff vem do domínio (4.6), `1 s · 2^(attempts-1)` com teto de 5 min, e o evento nunca é descartado. Um "DLQ da outbox" tiraria o evento do fluxo normal, e para um evento financeiro isso é perda. Um `attempts` alto aparece no log e nas métricas.
+
+**Reordenação.** A ordem por wallet do FIFO é só otimização. Ela quebra em três situações:
+- **falha parcial dentro de um lote**: o evento da versão 2 de uma wallet é aceito e o da versão 1 falha. O da versão 1 sai depois, num retry, já atrás do da versão 2;
+- **retry com backoff**: um evento atrasado sai depois de eventos mais novos da mesma wallet;
+- **publishers concorrentes**: dois lotes diferentes podem levar eventos da mesma wallet.
+
+Não é viável impedir isso sem serializar a publicação por wallet, o que seria um lock global por agregado. Por isso **o consumidor ordena pelo `walletVersion` do `WalletBalanceChanged`**, e não pela ordem de chegada. O claim usa `ORDER BY next_attempt_at, id`, que segue o índice parcial e, na ausência de retries, a ordem de criação (UUIDv7).
+
+### 6.5 Laço e shutdown
+Cada instância roda um `OutboxPublisherWorker` (desligável com `OUTBOX_PUBLISHER_ENABLED=false`). Se o lote veio cheio, o próximo tick roda na hora; se veio incompleto, espera `OUTBOX_POLL_INTERVAL_MS` (default 500 ms), num sono interrompível. Um tick que falha (banco fora do ar) é desfeito, gera log e incrementa `outbox_tick_errors_total`, e o laço continua.
+
+**Shutdown.** O `stop()` roda no hook `beforeApplicationShutdown` do Nest, disparado por `app.close()` ou pelo SIGTERM (`enableShutdownHooks`). Ele para de buscar lotes, acorda o laço se estiver dormindo e **espera o lote em andamento chegar ao commit**. Só depois disso o MikroORM fecha o pool, no hook `onApplicationShutdown`.
+
+**Limitação do ambiente:** no Windows não há SIGTERM real entre processos; o `kill` do Bun termina o processo à força. O teste de shutdown chama `app.close()`, que percorre os mesmos hooks. O caso de morte abrupta é coberto pelo teste de crash (6.3).
+
+### 6.6 Outbox lag
+`outbox_lag_seconds` = `now − min(occurred_at)` dos eventos pendentes, incluindo os que esperam retry (zero quando não há nenhum). É medido ao fim de cada tick. Vai para a porta `Metrics`, por enquanto num registro em memória por instância; a exposição em `/metrics` fica para a fatia 9.
+
+Contadores: `outbox_published_total`, `outbox_retries_total{fault}`, `outbox_sender_faults_total{code}`, `outbox_publish_call_failures_total{reason}` e `outbox_tick_errors_total`.

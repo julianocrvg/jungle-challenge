@@ -8,7 +8,7 @@ import type {
   WalletRepository,
 } from '../../application/ports/unit-of-work';
 import { Money } from '../../domain/money';
-import type { OutboxMessage } from '../../domain/outbox-message';
+import { OutboxMessage } from '../../domain/outbox-message';
 import {
   type FailureCode,
   WagerTransaction,
@@ -218,6 +218,54 @@ class SqlOutboxRepository implements OutboxRepository {
         [message.id, message.aggregateId, message.eventType, JSON.stringify(message.payload), message.occurredAt,
           message.attempts, message.nextAttemptAt],
       );
+    }
+  }
+
+  async claimDue(now: Date, limit: number): Promise<OutboxMessage[]> {
+    // SKIP LOCKED: cada publisher pega linhas que nenhum outro travou, sem esperar e sem lock global. O lock
+    // vale até o commit do lote, então uma linha nunca está em dois lotes ao mesmo tempo. A busca usa o
+    // índice parcial outbox_pending_idx (next_attempt_at) WHERE published_at IS NULL.
+    const rows = await this.em.execute<Row[]>(
+      `SELECT id, aggregate_id, event_type, payload, occurred_at, attempts, next_attempt_at
+       FROM outbox
+       WHERE published_at IS NULL AND next_attempt_at <= ?
+       ORDER BY next_attempt_at, id
+       LIMIT ?
+       FOR UPDATE SKIP LOCKED`,
+      [now, limit],
+    );
+    return rows.map((row) => OutboxMessage.rehydrate({
+      id: str(row, 'id'),
+      aggregateId: str(row, 'aggregate_id'),
+      eventType: str(row, 'event_type'),
+      payload: row.payload as Record<string, unknown>,
+      occurredAt: date(row, 'occurred_at'),
+      attempts: row.attempts as number,
+      nextAttemptAt: date(row, 'next_attempt_at'),
+    }));
+  }
+
+  async markPublished(message: OutboxMessage): Promise<void> {
+    await this.updatePending(message, `published_at = ?`, [message.publishedAt ?? null]);
+  }
+
+  async saveRetry(message: OutboxMessage): Promise<void> {
+    await this.updatePending(message, `attempts = ?, next_attempt_at = ?`, [message.attempts, message.nextAttemptAt]);
+  }
+
+  async oldestPendingOccurredAt(): Promise<Date | undefined> {
+    const [row] = await this.em.execute<Row[]>(`SELECT min(occurred_at) AS oldest FROM outbox WHERE published_at IS NULL`);
+    return (row?.oldest ?? undefined) as Date | undefined;
+  }
+
+  // Guarda `published_at IS NULL`: com a linha travada por claimDue, zero linhas aqui é bug, e o lote é desfeito.
+  private async updatePending(message: OutboxMessage, set: string, params: unknown[]): Promise<void> {
+    const rows = await this.em.execute<Row[]>(
+      `UPDATE outbox SET ${set} WHERE id = ? AND published_at IS NULL RETURNING id`,
+      [...params, message.id],
+    );
+    if (rows.length !== 1) {
+      throw new Error(`Outbox message ${message.id} was not pending under the claim lock`);
     }
   }
 }
