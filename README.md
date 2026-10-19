@@ -221,6 +221,15 @@ Parar a app local antes de `bun test` é uma recomendação, não uma exigência
 
 Os testes de integração usam PostgreSQL e LocalStack **reais** (nada de mocks de banco ou de SQS) e recriam o schema do banco `wagering_test`, sem tocar no banco da aplicação. Os de concorrência usam paralelismo real (`Promise.all` e processos separados via `Bun.spawn`). Todo teste de integração e de concorrência termina verificando `wallet.balance == saldo reconstruído pelo ledger`.
 
+### Teste de carga (opcional)
+
+```bash
+bun run test:load             # contra a API já no ar em http://localhost:3000
+LOAD_URLS=http://localhost:3001,http://localhost:3002,http://localhost:3003 LOAD_REPEATS=3 bun run test:load
+```
+
+Fora do `bun test`. **Usa o banco e as filas de desenvolvimento** (`wagering`, não `wagering_test`): cria wallets novas a cada execução, e os dados ficam lá. Não sobe nem derruba instâncias. Cenários `distinct-wallets`, `hot-wallet` e `mixed`; ao fim confere reconciliação, ledger e saldo e sai com código 1 se algo divergir. Relatório JSON em `load-results/` (fora do git). Variáveis, metodologia e resultados: ARCHITECTURE 16.
+
 ## Decisões e limitações
 
 Resumo; os detalhes e as justificativas estão em [ARCHITECTURE.md](ARCHITECTURE.md).

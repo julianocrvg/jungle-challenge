@@ -86,3 +86,14 @@ Decisões em ARCHITECTURE.md, seção 8 (e 3, 5.10, 5.11).
 - [x] Orçamento do pool: workers somados ≤ `DB_POOL_MAX` − 5
 - [x] Métricas: resolvidas, expiradas, retries, no-ops, erros, pendentes e idade da mais antiga
 - [x] Testes: unidade (cronograma, tentativas, configuração), resolve (corrida, TTL, tentativas, cadeia nas duas ordens) e worker (referência chega, dois workers, TTL até o SQS, cadeia, reinício, shutdown), com `afterEach` de valores monetários em log
+
+## Fatia 12: teste de carga opcional (concluída)
+
+Decisões e resultados em ARCHITECTURE.md, seção 16.
+
+- [x] `bun run test:load` (`scripts/load/`): cenários `distinct-wallets`, `hot-wallet` e `mixed`; modelo fechado; fora do `bun test`; banco de desenvolvimento
+- [x] Verificação sob carga em `bigint`: reconciliação, saldo esperado pelo cliente, ledger e `wager_transactions_total`; reenvio das operações sem desfecho
+- [x] Drenagem pelo count de pendentes no banco; relatório JSON em `load-results/` (fora do git)
+- [x] Unidade: percentis, deltas e agregação de métricas, quantis de histograma, centavos
+- [x] Resultados reais (1 e 3 instâncias, 3 repetições): zero divergências, zero 503, zero conflitos de lock
+- [ ] Achado (não é bug de correção): com 1 instância o publisher da outbox fica atrás da submissão (lag de até ~80 s); ajuste de lote/instâncias não foi explorado

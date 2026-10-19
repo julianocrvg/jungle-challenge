@@ -12,7 +12,8 @@
     "test": "bun test",
     "test:unit": "bun test test/unit",
     "test:integration": "bun test test/integration",
-    "test:multi-instance": "bun test test/integration/multi-instance.test.ts"
+    "test:multi-instance": "bun test test/integration/multi-instance.test.ts",
+    "test:load": "bun scripts/load/main.ts"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.1152.0",

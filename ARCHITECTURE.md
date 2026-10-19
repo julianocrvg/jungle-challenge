@@ -18,10 +18,11 @@ Decisões técnicas do serviço, agrupadas por componente. Cada entrada diz o qu
 | Outbox, inbox e mensageria | 6 (publisher), 7 (consumidor, inbox, DLQ), 8 (pendentes) |
 | Observabilidade | 11.2 (logs), 11.3 (`correlationId`), 11.4 (métricas), 10.1 (health) |
 | Limitações conhecidas | [15](#15-limitações-conhecidas) |
+| Teste de carga | [16](#16-teste-de-carga-bun-run-testload) |
 | Eliminatórias → proteção → teste | [13](#13-falhas-eliminatórias-onde-está-a-proteção-e-qual-teste-a-prova) |
 | Testes exigidos pelo enunciado | [14](#14-testes-exigidos-pelo-enunciado-seção-13-e-onde-estão) |
 
-**Por seção:** 0 Visão geral · 1 Setup · 2 Schema · 3 `failure_code` · 4 Domínio · 5 Submissão · 6 Publisher da outbox · 7 Consumidor SQS · 8 Worker de PENDING_REFERENCE · 9 Consultas e reconciliação · 10 Health e múltiplas instâncias · 11 Observabilidade e autenticação · 12 Mapeamento HTTP · 13 Eliminatórias · 14 Testes do enunciado · 15 Limitações.
+**Por seção:** 0 Visão geral · 1 Setup · 2 Schema · 3 `failure_code` · 4 Domínio · 5 Submissão · 6 Publisher da outbox · 7 Consumidor SQS · 8 Worker de PENDING_REFERENCE · 9 Consultas e reconciliação · 10 Health e múltiplas instâncias · 11 Observabilidade e autenticação · 12 Mapeamento HTTP · 13 Eliminatórias · 14 Testes do enunciado · 15 Limitações · 16 Teste de carga.
 
 ## 0. Visão geral
 
@@ -823,3 +824,72 @@ Consolidadas; o detalhe está na seção indicada.
 - A varredura de `number` em `src/` é heurística por proximidade (linha e vizinhas) com nomes como `amount`, `balance`, `money`, `price`, `stake`, `payout`; `version` é excluído por ser inteiro. Não vê dinheiro com outro nome nem fluxo por variável intermediária.
 
 **Testes:** ver as lacunas listadas em 14.
+
+## 16. Teste de carga (`bun run test:load`)
+
+Diferencial opcional do enunciado. **Não é prova de capacidade de produção**: mede o comportamento desta implementação nesta máquina e, principalmente, verifica se as invariantes financeiras sobrevivem à carga. Fica fora do `bun test` (os arquivos de `scripts/load/` não casam com o padrão de coleta do Bun); só as funções puras têm teste na suíte (`test/unit/load/load-stats.test.ts`). Nenhuma linha de `src/` foi alterada.
+
+### 16.1 Metodologia
+- **Modelo fechado.** `LOAD_CONCURRENCY` clientes (default 32); cada um espera a resposta antes de enviar a próxima. **Limitação (coordinated omission):** quando o servidor engasga, os clientes deixam de enviar, então a cauda de latência aparece menor do que apareceria com chegadas independentes (modelo aberto). O número é "latência com N clientes simultâneos", não "latência a X req/s". Com 32 clientes e `DB_POOL_MAX=20` por instância, há mais clientes que conexões numa instância: a diferença espera na fila do pool (e, na hot wallet, no lock).
+- **Alvo.** Instâncias já no ar (`LOAD_URLS`, lista separada por vírgula; cada requisição faz round-robin). O script não sobe nem derruba nada. Usa o **banco e as filas de desenvolvimento** (`wagering`), nunca `wagering_test`. Cada execução cria wallets com `playerId` novo e `providerId` próprio, então pode repetir sem colisão (os dados ficam no banco de desenvolvimento).
+- **Cenários** (cada um com `LOAD_DURATION_S`, default 30, e `LOAD_REPEATS`):
+  - `distinct-wallets`: 200 wallets com saldo `10000000.00`; BETs de 1,00 a 5,00 com `Idempotency-Key` única em wallets sorteadas. Throughput sem contenção.
+  - `hot-wallet`: todos os clientes na **mesma** wallet.
+  - `mixed`: BET seguida de WIN (50%), LOSS (25%) ou REFUND com referência (25%), em 200 wallets, com ~5% de replays (mesma key e payload; precisa voltar `idempotentReplay: true`).
+- **Medição.** Latência por requisição no cliente (`performance.now`), p50/p95/p99/máx, **depois** de `LOAD_WARMUP_S` (3 s) descartados; throughput = respostas 2xx por segundo na mesma janela. Contagem por código (200, 202, 409, 422, 503, outros e erro de rede, separados). Do servidor, delta de `/metrics` (antes e depois, somando counters das instâncias): `db_lock_conflicts_total{sqlstate}`, `wager_transactions_total`, `wager_duplicates_total`, `outbox_published_total` e o histograma `http_request_duration_seconds` da rota de submissão (quantis por interpolação dos buckets). O `outbox_lag_seconds` é amostrado a cada 1 s e entra só como máximo (gauge global, agregado com `max`; tem cache de 5 s, 11.4).
+- **Drenagem da outbox.** O critério de fim é **zero linhas pendentes no banco** (`published_at IS NULL`, `DATABASE_URL`), não o lag. Sem acesso ao banco, cai para "`outbox_published_total` estável por 3 s" e o relatório diz qual critério valeu. Antes de cada carga o script drena o que o setup gerou, para a medida ser só da carga.
+- **503 por `lock_timeout` (55P03) é resultado, não falha de correção.** É contado à parte; a operação fica "sem desfecho" e é reenviada ao fim.
+
+### 16.2 Verificação de correção (a parte que importa)
+O saldo esperado é calculado **no cliente, em `bigint` (centavos)**, e só conta transações observadas como `200 PROCESSED`. Erro de rede, timeout e 503 ficam pendentes e, depois da carga, são reenviados com a **mesma `Idempotency-Key`** (replay seguro) antes de fechar a conta. Qualquer divergência encerra o script com código 1 e imprime o que divergiu. Por wallet:
+1. `POST /wallets/:id/reconciliation` devolve `consistent: true`;
+2. saldo de `GET /wallets/:id` == `inicial − ΣBET + ΣWIN + ΣREFUND` esperado pelo cliente;
+3. ledger paginado inteiro: nº e soma de DEBIT == BETs PROCESSED; nº e soma de CREDIT == OPENING + WIN + REFUND;
+4. no agregado, `wager_transactions_total{PROCESSED}` do servidor == transações distintas que o cliente viu como 200 PROCESSED (se outro tráfego usar o ambiente, esta checagem acusa).
+
+Dinheiro no script: só `bigint` e strings decimais (`scripts/load/cents.ts`); não há `Number`/`parseFloat`/`toFixed` sobre valor monetário (o único `parseFloat` lê o limite `le` de bucket de latência).
+
+### 16.3 Como rodar
+```bash
+bun run test:load                                   # 1 instância em localhost:3000, 1 repetição
+LOAD_REPEATS=3 bun run test:load                    # min/mediana/máx
+LOAD_URLS=http://localhost:3001,http://localhost:3002,http://localhost:3003 LOAD_REPEATS=3 bun run test:load
+```
+Variáveis: `LOAD_URLS`, `LOAD_DURATION_S` (30), `LOAD_WARMUP_S` (3), `LOAD_CONCURRENCY` (32), `LOAD_WALLETS` (200), `LOAD_REPEATS` (1), `LOAD_DRAIN_TIMEOUT_S` (120), `LOAD_SCENARIOS`, `DATABASE_URL`. Relatório JSON (com o ambiente) em `load-results/<timestamp>.json`, fora do git.
+
+### 16.4 Resultados desta máquina (execução de 2026-10-19)
+**Ambiente:** AMD Ryzen 5 5500 (12 threads), 15,8 GiB, Windows 11 (win32 10.0.26200) com Docker Desktop (WSL2), Bun 1.4.3, `postgres:16-alpine`, `localstack/localstack:3.8`. Cada instância com `DB_POOL_MAX=20`, `DB_LOCK_TIMEOUT_MS=10000`, publisher e consumidor ligados em **todas** (defaults: lote 10, poll 500 ms). 32 clientes, 30 s por execução, 3 s de aquecimento, **3 repetições por cenário** (valores: min / mediana / máx). Cliente, servidores, Postgres e LocalStack na mesma máquina.
+
+**1 instância** (porta 3000):
+
+| Cenário | Throughput 2xx/s | p50 ms | p95 ms | p99 ms | Drenagem da outbox | Lag máx |
+|---|---|---|---|---|---|---|
+| distinct-wallets | 354,8 / 386,7 / 534,0 | 56,5 / 76,1 / 78,2 | 89,3 / 139,9 / 178,4 | 170,2 / 198,0 / 278,3 | 31,1 / 50,1 / 52,7 s | 51 a 82 s |
+| hot-wallet | 105,3 / 111,5 / 133,3 | 244,8 / 281,8 / 300,0 | 290,1 / 392,9 / 396,8 | 310,3 / 428,6 / 648,8 | 9,1 / 9,6 / 11,1 s | 24 a 53 s |
+| mixed | 371,1 / 381,4 / 478,6 | 63,8 / 78,8 / 83,1 | 94,2 / 123,6 / 136,8 | 129,1 / 159,1 / 191,6 | 38,6 / 38,7 / 51,6 s | 42 a 53 s |
+
+**3 instâncias** (portas 3001 a 3003, round-robin no cliente):
+
+| Cenário | Throughput 2xx/s | p50 ms | p95 ms | p99 ms | Drenagem da outbox | Lag máx |
+|---|---|---|---|---|---|---|
+| distinct-wallets | 531,2 / 574,1 / 646,0 | 46,4 / 49,9 / 52,8 | 79,7 / 98,8 / 114,7 | 104,2 / 133,2 / 182,0 | 19,2 / 21,1 / 22,9 s | 27 s |
+| hot-wallet | 108,6 / 120,7 / 139,7 | 239,5 / 265,2 / 306,3 | 308,1 / 374,1 / 408,1 | 352,3 / 538,6 / 573,8 | 0,25 / 0,25 / 0,51 s | 5 a 28 s |
+| mixed | 570,2 / 598,1 / 727,2 | 40,6 / 43,7 / 49,9 | 74,8 / 91,0 / 96,2 | 105,0 / 115,6 / 354,1 | 14,6 / 24,1 / 30,1 s | 20 a 37 s |
+
+**Correção e erros (as 18 execuções):** zero divergências em reconciliação, saldo e ledger (de ~3,2 mil a ~19,7 mil lançamentos por execução); `wager_transactions_total{PROCESSED}` do servidor igual ao do cliente em todas. Todas as respostas foram 200: **zero 202, 409, 422, 503, outros e erros de rede**, e **zero** `db_lock_conflicts_total` (nem 55P03, nem 40P01). No `mixed`, de 515 a 1088 replays por execução voltaram como `idempotentReplay: true` e contaram em `wager_duplicates_total{source="http"}`. A latência média do servidor (histograma) ficou próxima à do cliente (por exemplo, `distinct-wallets` com 1 instância: média de 55 a 85 ms no servidor contra p50 de 56 a 78 ms no cliente), o que indica que o tempo está dentro do processamento, não na rede local.
+
+### 16.5 O que os números dizem e o que NÃO dizem
+**Dizem:**
+- **A invariante financeira sobrevive à carga**, com 1 e com 3 instâncias, em wallets distintas, em uma só wallet e com reversões e replays. É o resultado que importa, e vale mais que qualquer throughput.
+- **A hot wallet cai por desenho, não por defeito.** Com todos os clientes na mesma wallet, o throughput ficou em ~105 a 140 req/s mesmo com 3 instâncias (contra ~355 a 650 em wallets distintas), e a latência sobe porque as 32 requisições esperam em fila no `FOR UPDATE`. Isso é o trade-off da seção 0.2 funcionando: a unidade de concorrência é a wallet, e uma wallet processa uma transação por vez. Adicionar instâncias não ajuda, o que mostra que o lock é por wallet e serializa de fato (sem 40P01 e sem 503, porque o `lock_timeout` de 10 s nunca foi alcançado).
+- **O publisher da outbox é o gargalo do caminho assíncrono, não a submissão.** Com 1 instância os eventos ficam pendentes por dezenas de segundos (lag máximo de 51 a 82 s no `distinct-wallets`): a submissão gera 2 eventos por transação mais rápido do que um publisher (lote de 10, uma chamada ao LocalStack por lote) os envia. Com 3 instâncias a drenagem ficou ~2,5 vezes mais rápida (`SKIP LOCKED` dividindo as linhas). A correção não depende disso (o evento é gravado na mesma transação), mas é onde ajustar `OUTBOX_BATCH_SIZE` ou o número de instâncias teria efeito. Na hot wallet o publisher acompanha a carga, por isso a drenagem é de ~0,3 s com 3 instâncias.
+- **Escala com instâncias em wallets distintas**: de ~387 para ~574 req/s na mediana (~1,5×) com 3 instâncias, bem abaixo de 3×.
+
+**NÃO dizem:**
+- **Nada sobre produção.** Windows 11 com Docker Desktop (WSL2); cliente, 1 a 3 instâncias, Postgres e LocalStack disputam as mesmas 12 threads. O custo do gerador de carga na mesma CPU não foi isolado, e o ganho de 1,5× com 3 instâncias provavelmente é limitado por isso e pelo Postgres único.
+- **LocalStack não representa o SQS real**: latência, limites de vazão e comportamento de FIFO diferem. O tempo de drenagem e o lag da outbox valem só como ordem de grandeza.
+- **Só o caminho HTTP foi carregado.** O consumidor SQS de `wager-transactions.fifo` (7) e o worker de pendentes (8) rodaram ociosos.
+- **Variação grande entre repetições** (por exemplo, `distinct-wallets` com 1 instância: 355 a 534 req/s). Três repetições dão uma faixa, não uma estatística; não há intervalo de confiança nem isolamento de ruído do SO. Diferenças menores que essa faixa (por exemplo, hot wallet com 1 contra 3 instâncias) não são significativas.
+- **Modelo fechado**: a latência com 32 clientes não prevê a latência sob uma taxa de chegada fixa (coordinated omission, 16.1).
+- **Wallets com pouco histórico**: wallets com milhões de lançamentos (reconciliação `O(n)`, 9.4) não foram medidas.
+- Configuração default e `LOG_LEVEL=info`; sem ajuste de pool, de `synchronous_commit` nem do publisher. Execução única de cada configuração (um dia, uma máquina).
