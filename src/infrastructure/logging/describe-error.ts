@@ -7,6 +7,7 @@ import { constraintOf, sqlStateOf } from '../persistence/database-errors';
  * Cada campo só sai se casar com um formato fechado; o que não casa vira ausente.
  */
 
+const SQL_STATE = /^[0-9A-Z]{5}$/;
 const CODE = /^[A-Z][A-Z0-9_]{1,31}$/;
 const CONSTRAINT = /^[a-z0-9_]{1,63}$/;
 const FRAME = /^\s+at \S/;
@@ -45,7 +46,7 @@ function summarize(thrown: unknown): ErrorSummary {
   const errorName = typeof rawName === 'string' && SAFE_ERROR_NAME.test(rawName) ? rawName : isObject && thrown instanceof Error ? 'Error' : `NonError_${typeof thrown}`;
   // Todo SQLSTATE tem ao menos um dígito; `EPIPE` (5 letras) é um code de socket, não um SQLSTATE.
   const candidateState = isObject ? sqlStateOfSafe(thrown) : undefined;
-  const sqlState = candidateState !== undefined && /\d/.test(candidateState) ? candidateState : undefined;
+  const sqlState = candidateState !== undefined && SQL_STATE.test(candidateState) && /\d/.test(candidateState) ? candidateState : undefined;
   const rawCode = isObject ? read(thrown, 'code') : undefined;
   const code = typeof rawCode === 'string' && CODE.test(rawCode) && rawCode !== sqlState ? rawCode : undefined;
   const rawConstraint = isObject ? constraintOfSafe(thrown) : undefined;
@@ -124,12 +125,20 @@ function collectCauses(thrown: unknown, depth: number, seen: WeakSet<object>, ou
   }
 }
 
+/**
+ * Total: nunca lança. `instanceof` sobre um Proxy revogado (ou com trap que lança) estoura fora dos acessos
+ * protegidos por `read`, e um log de erro não pode derrubar quem está tratando o erro.
+ */
 export function describeError(thrown: unknown): ErrorDescription {
-  const summary = summarize(thrown);
-  const frames = thrown instanceof Error ? framesOf(thrown) : [];
-  const causes: ErrorSummary[] = [];
-  collectCauses(thrown, 1, new WeakSet<object>(), causes);
-  return { ...summary, frames, causes };
+  try {
+    const summary = summarize(thrown);
+    const frames = thrown instanceof Error ? framesOf(thrown) : [];
+    const causes: ErrorSummary[] = [];
+    collectCauses(thrown, 1, new WeakSet<object>(), causes);
+    return { ...summary, frames, causes };
+  } catch {
+    return { errorName: 'Error', frames: [], causes: [] };
+  }
 }
 
 function labelOf(summary: ErrorSummary): string {
@@ -137,14 +146,19 @@ function labelOf(summary: ErrorSummary): string {
   return detail === undefined ? summary.errorName : `${summary.errorName}:${detail}`;
 }
 
-/** O `describeError` achatado em campos de log (a porta só aceita primitivos). */
+/** O `describeError` achatado em campos de log (a porta só aceita primitivos). Total, como o `describeError`. */
 export function errorFields(thrown: unknown): LogFields {
-  const description = describeError(thrown);
-  // Sem chaves `undefined`: espalhado sobre o contexto do log, uma chave ausente não pode apagar uma que existe.
-  const fields: Record<string, string> = { errorName: description.errorName, stack: description.frames.join('\n') };
-  if (description.sqlState !== undefined) fields.sqlState = description.sqlState;
-  if (description.code !== undefined) fields.code = description.code;
-  if (description.constraint !== undefined) fields.constraint = description.constraint;
-  if (description.causes.length > 0) fields.causes = description.causes.map(labelOf).join(',');
-  return fields;
+  try {
+    const description = describeError(thrown);
+    // Sem chaves `undefined`: espalhado sobre o contexto do log, uma chave ausente não pode apagar uma que existe.
+    const fields: Record<string, string> = { errorName: description.errorName };
+    if (description.frames.length > 0) fields.stack = description.frames.join('\n');
+    if (description.sqlState !== undefined) fields.sqlState = description.sqlState;
+    if (description.code !== undefined) fields.code = description.code;
+    if (description.constraint !== undefined) fields.constraint = description.constraint;
+    if (description.causes.length > 0) fields.causes = description.causes.map(labelOf).join(',');
+    return fields;
+  } catch {
+    return { errorName: 'Error' };
+  }
 }

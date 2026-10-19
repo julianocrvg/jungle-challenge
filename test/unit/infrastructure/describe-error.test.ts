@@ -176,4 +176,74 @@ describe('describeError', () => {
     expect(fields.causes).toBe('Error:55P03');
     expect(typeof fields.stack).toBe('string');
   });
+
+  test('errorFields omite a chave stack quando não há frames', () => {
+    const error = new Error('boom');
+    error.stack = 'Totally different\n    at 100.00 (a:1:1)'; // não confere com o cabeçalho: sem frames
+    const fields = errorFields(error);
+    expect(fields).toEqual({ errorName: 'Error' });
+    expect('stack' in fields).toBe(false);
+    expect('stack' in errorFields('not an error')).toBe(false);
+  });
+});
+
+describe('funções totais (nunca lançam)', () => {
+  const FALLBACK = { errorName: 'Error', frames: [], causes: [] };
+  const revoked = (): object => {
+    const { proxy, revoke } = Proxy.revocable({}, {});
+    revoke();
+    return proxy;
+  };
+  /** Proxy vivo cujo `getPrototypeOf` e `get` lançam: `instanceof` e qualquer leitura estouram. */
+  const hostile = (): object =>
+    new Proxy({}, {
+      getPrototypeOf: () => { throw new Error('trap 123.45'); },
+      get: () => { throw new Error('trap 123.45'); },
+    });
+
+  test('Proxy revogado como throwable devolve exatamente o fallback', () => {
+    // Sanidade do cenário: instanceof sobre o proxy revogado lança de verdade.
+    expect(() => revoked() instanceof Error).toThrow();
+    expect(describeError(revoked())).toEqual(FALLBACK);
+    expect(errorFields(revoked())).toEqual({ errorName: 'Error' });
+  });
+
+  test('Proxy revogado como cause devolve exatamente o fallback', () => {
+    expect(describeError(new Error('outer 123.45', { cause: revoked() }))).toEqual(FALLBACK);
+  });
+
+  test('Proxy revogado dentro de AggregateError.errors devolve exatamente o fallback', () => {
+    expect(describeError(new AggregateError([revoked()], 'agg 123.45'))).toEqual(FALLBACK);
+  });
+
+  test('Proxy com trap que lança (getter hostil) como throwable, cause e errors', () => {
+    expect(describeError(hostile())).toEqual(FALLBACK);
+    expect(describeError(new Error('outer', { cause: hostile() }))).toEqual(FALLBACK);
+    expect(describeError(new AggregateError([hostile()], 'agg'))).toEqual(FALLBACK);
+    expect(json(errorFields(hostile()))).not.toContain('123.45');
+  });
+
+  test('getter que lança em propriedades lidas por read() não chega ao fallback e não vaza', () => {
+    const error = new Error('secret 123.45');
+    for (const key of ['name', 'code', 'sqlState', 'constraint', 'cause', 'errors']) {
+      Object.defineProperty(error, key, { get: () => { throw new Error('boom'); } });
+    }
+    expect(() => describeError(error)).not.toThrow();
+    const description = describeError(error);
+    expect(description.errorName).toBe('Error');
+    expect(description.causes).toEqual([]);
+    expect(json(description)).not.toContain('123.45');
+  });
+});
+
+describe('sqlState', () => {
+  test('um code string com dígito mas fora do formato de 5 caracteres não vira sqlState', () => {
+    // O sqlStateOf já exige o formato; o summarize repete a regra (defesa em profundidade), então este teste
+    // passaria mesmo sem a mudança do commit: ele fixa o comportamento, não o prova por mutação.
+    for (const code of ['ab1', 'A1', '1234', '123456', '40p01', 'ECONNRESET1', '4001 ']) {
+      const description = describeError(Object.assign(new Error('x'), { code }));
+      expect(description.sqlState).toBeUndefined();
+    }
+    expect(describeError(Object.assign(new Error('x'), { code: '40P01' })).sqlState).toBe('40P01');
+  });
 });
