@@ -1,10 +1,12 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
-import type { SQSClient } from '@aws-sdk/client-sqs';
+import { SendMessageBatchCommand, type SendMessageBatchCommandOutput, type SQSClient } from '@aws-sdk/client-sqs';
 import { MikroORM } from '@mikro-orm/postgresql';
 import type { EventPublisher, PublishResult } from '../../src/application/ports/event-publisher';
 import { defaultIdleInTransactionTimeoutMs } from '../../src/config';
 import type { OutboxMessage } from '../../src/domain/outbox-message';
-import { createSqsClient } from '../../src/infrastructure/messaging/sqs-event-publisher';
+import { createSqsClient, SqsEventPublisher } from '../../src/infrastructure/messaging/sqs-event-publisher';
+import type { TransactionalRepositories, TransactionOptions, UnitOfWork } from '../../src/application/ports/unit-of-work';
+import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm-unit-of-work';
 import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { parseTimestamp } from '../../src/infrastructure/persistence/timestamps';
 import { CapturingLogger, createWalletViaApi, startTestApp, submit, type TestApp, wagerPayload } from './support/app';
@@ -138,7 +140,7 @@ describe('PublishOutboxBatch against LocalStack', () => {
     const { batch, metrics } = outboxPublisher({ orm, publisher: sqsPublisher(queueUrl) });
 
     expect(await drain(batch)).toBe(created.size);
-    expect(metrics.gaugeValue('outbox_lag_seconds')).toBe(0);
+    expect(metrics.counter('outbox_published_total')).toBe(created.size);
 
     const rows = await sql(`SELECT id, aggregate_id, event_type, published_at FROM outbox WHERE id IN (?)`, [[...created]]);
     expect(rows.every((row) => row.published_at !== null)).toBe(true);
@@ -211,6 +213,210 @@ describe('PublishOutboxBatch against LocalStack', () => {
     clock.advance(1_000);
     expect((await outboxPublisher({ orm: ownOrm, clock, publisher: sqsPublisher(queueUrl) }).batch.execute()).published).toBe(1);
     await expectFullyPublished(queueUrl, created);
+  });
+});
+
+/**
+ * Cliente SQS que delega ao LocalStack real, mas tira do `SendMessageBatch` as entradas listadas e as devolve em
+ * `Failed`, no formato da resposta real (`Id`, `SenderFault`, `Code`, `Message`). Assim o adaptador de verdade
+ * (`fromBatchOutput`) faz o mapeamento, e as demais entradas chegam à fila.
+ */
+class PartialBatchClient {
+  constructor(
+    private readonly real: SQSClient,
+    private readonly reject: Map<string, { senderFault: boolean; code: string }>,
+  ) {}
+
+  async send(command: unknown, options?: { abortSignal?: AbortSignal }): Promise<SendMessageBatchCommandOutput> {
+    if (!(command instanceof SendMessageBatchCommand)) throw new Error('PartialBatchClient only handles SendMessageBatch');
+    const entries = command.input.Entries ?? [];
+    const kept = entries.filter((entry) => !this.reject.has(entry.Id ?? ''));
+    const output = kept.length === 0
+      ? { Successful: [], Failed: [], $metadata: {} }
+      : await this.real.send(new SendMessageBatchCommand({ ...command.input, Entries: kept }), options);
+    const failed = entries.flatMap((entry) => {
+      const rejection = this.reject.get(entry.Id ?? '');
+      return rejection === undefined ? [] : [{ Id: entry.Id, SenderFault: rejection.senderFault, Code: rejection.code, Message: 'rejected by test' }];
+    });
+    return { ...output, Failed: [...(output.Failed ?? []), ...failed] };
+  }
+}
+
+/**
+ * Derruba, a partir de OUTRA conexão, a sessão do lote do publisher: a única com `RowShareLock` na outbox é a do
+ * claim (`FOR UPDATE`; um INSERT pega `RowExclusiveLock`). Devolve os pids derrubados.
+ */
+async function terminateClaimSession(admin: Sql): Promise<number[]> {
+  const rows = await admin(
+    `SELECT l.pid, pg_terminate_backend(l.pid) AS ok
+     FROM (SELECT DISTINCT l.pid FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+           WHERE c.relname = 'outbox' AND l.mode = 'RowShareLock' AND l.pid <> pg_backend_pid()) l`,
+  );
+  return rows.filter((row) => row.ok === true).map((row) => Number(row.pid));
+}
+
+/**
+ * Delega ao publisher real (a mensagem chega ao LocalStack) e, depois do envio, derruba a sessão do lote. O use case
+ * recebe o sucesso do broker e falha no primeiro comando seguinte (o UPDATE de published_at): nada é commitado.
+ */
+class KillSessionAfterSend implements EventPublisher {
+  readonly terminated: number[] = [];
+  constructor(private readonly inner: EventPublisher, private readonly admin: Sql) {}
+
+  async publish(messages: readonly OutboxMessage[], signal: AbortSignal): Promise<PublishResult> {
+    const result = await this.inner.publish(messages, signal);
+    this.terminated.push(...await terminateClaimSession(this.admin));
+    return result;
+  }
+}
+
+/**
+ * Decorator do UnitOfWork REAL: depois que o trabalho do lote terminou (envio e todos os UPDATEs), derruba a sessão
+ * antes de devolver o controle ao `transactional`, de modo que a falha cai no próprio COMMIT. Pega um incremento
+ * de métrica colocado no fim do callback, que a variante "depois do envio" não alcança.
+ */
+class KillSessionBeforeCommit implements UnitOfWork {
+  constructor(private readonly real: UnitOfWork, private readonly admin: Sql, readonly terminated: number[]) {}
+
+  run<T>(work: (repositories: TransactionalRepositories) => Promise<T>, options?: TransactionOptions): Promise<T> {
+    return this.real.run(async (repositories) => {
+      const result = await work(repositories);
+      this.terminated.push(...await terminateClaimSession(this.admin));
+      return result;
+    }, options);
+  }
+}
+
+/** Falha (em vez de travar o teste) se a promessa não terminar no prazo: uma vaga de pool vazada travaria. */
+function within<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${what} did not finish in ${ms}ms (pool slot leaked?)`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+describe('partial publish against real Postgres and LocalStack', () => {
+  test('SendMessageBatch with Failed entries (SenderFault true and false): only confirmed entries get published_at', async () => {
+    const queueUrl = await newQueue();
+    const created = [...await seedEvents(api, 1, 1)]; // 3 eventos: abertura, Processed e BalanceChanged da aposta
+    const [acceptedId, senderId, serviceId] = created as [string, string, string];
+    const clock = new ManualClock(new Date());
+    const client = new PartialBatchClient(createSqsClient(SQS), new Map([
+      [senderId, { senderFault: true, code: 'InvalidParameterValue' }],
+      [serviceId, { senderFault: false, code: 'InternalError' }],
+    ]));
+    const { batch, metrics } = outboxPublisher({
+      orm, clock, publisher: new SqsEventPublisher(client as unknown as SQSClient, queueUrl),
+    });
+
+    expect(await batch.execute()).toEqual({ claimed: 3, published: 1, retried: 2 });
+    const rows = new Map((await sql(`SELECT id, attempts, next_attempt_at, published_at, occurred_at FROM outbox WHERE id IN (?)`, [created]))
+      .map((row) => [row.id as string, row]));
+    expect(rows.get(acceptedId)?.published_at).not.toBeNull();
+    expect(rows.get(acceptedId)?.attempts).toBe(0);
+    for (const id of [senderId, serviceId]) {
+      expect(rows.get(id)?.published_at).toBeNull();
+      expect(rows.get(id)?.attempts).toBe(1);
+      expect(parseTimestamp(rows.get(id)?.next_attempt_at)).toEqual(new Date(clock.now().getTime() + 1_000));
+    }
+    expect(metrics.counter('outbox_published_total')).toBe(1);
+    expect(metrics.counter('outbox_retries_total', { fault: 'sender' })).toBe(1);
+    expect(metrics.counter('outbox_retries_total', { fault: 'service' })).toBe(1);
+    expect(metrics.counter('outbox_sender_faults_total', { code: 'InvalidParameterValue' })).toBe(1);
+    expect((await receiveAll(sqs, queueUrl, 1)).map((event) => event.eventId)).toEqual([acceptedId]);
+
+    // O lag (calculado no scrape, ARCHITECTURE 11.4) inclui as linhas que esperam retry.
+    const oldestFailed = Math.min(...[senderId, serviceId].map((id) => parseTimestamp(rows.get(id)?.occurred_at).getTime()));
+    expect(await new MikroOrmUnitOfWork(orm, 10_000).run(({ outbox }) => outbox.oldestPendingOccurredAt())).toEqual(new Date(oldestFailed));
+
+    clock.advance(1_000);
+    expect(await drain(outboxPublisher({ orm, clock, publisher: sqsPublisher(queueUrl) }).batch)).toBe(2);
+    expect(await pendingOutbox(sql)).toEqual([]);
+    const rest = countById(await receiveAll(sqs, queueUrl, 2));
+    expect(new Set(rest.keys())).toEqual(new Set([senderId, serviceId]));
+    expect([...rest.values()].every((count) => count === 1)).toBe(true);
+    expect(await walletsDivergingFromLedger(sql)).toEqual([]);
+  });
+
+  test('whole call rejected by the broker (exception, queue does not exist): every entry is retried, none is marked', async () => {
+    const queueUrl = await newQueue();
+    const created = await seedEvents(api, 1, 0);
+    const clock = new ManualClock(new Date());
+    const missing = `${SQS.endpoint}/000000000000/does-not-exist-${Bun.randomUUIDv7()}.fifo`;
+    const { batch, metrics } = outboxPublisher({ orm, clock, publisher: sqsPublisher(missing) });
+
+    expect(await batch.execute()).toEqual({ claimed: 1, published: 0, retried: 1 });
+    expect(metrics.counter('outbox_publish_call_failures_total', { reason: 'call_error' })).toBe(1);
+    expect(metrics.counter('outbox_retries_total', { fault: 'call' })).toBe(1);
+    expect(metrics.counter('outbox_published_total')).toBe(0);
+    expect((await pendingOutbox(sql)).map((row) => [row.id, row.attempts])).toEqual([[[...created][0], 1]]);
+
+    clock.advance(1_000);
+    await drain(outboxPublisher({ orm, clock, publisher: sqsPublisher(queueUrl) }).batch);
+    await expectFullyPublished(queueUrl, created);
+  });
+});
+
+describe('commit failure after the send', () => {
+  /**
+   * Postgres e LocalStack reais; só a sessão do lote é derrubada (pg_terminate_backend de outra conexão). Pool de UMA
+   * conexão: se a sessão morta vazasse a vaga (regressão do dc1bfb0), o reenvio no mesmo pool travaria.
+   */
+  async function expectCommitFailureRecovered(
+    arrange: (publisher: EventPublisher) => { publisher: EventPublisher; wrapUow?: (real: UnitOfWork) => UnitOfWork; terminated: number[] },
+  ): Promise<void> {
+    const queueUrl = await newQueue();
+    const created = await seedEvents(api, 1, 0);
+    const [eventId] = [...created] as [string];
+    const [before] = await sql(`SELECT next_attempt_at FROM outbox WHERE id = ?`, [eventId]);
+    const clock = new ManualClock(new Date());
+    const victimOrm = await MikroORM.init(createOrmConfig(TEST_DATABASE_URL, { poolMax: 1 }));
+    try {
+      const fault = arrange(sqsPublisher(queueUrl));
+      const failing = outboxPublisher({ orm: victimOrm, clock, publisher: fault.publisher, wrapUow: fault.wrapUow });
+
+      await expect(failing.batch.execute()).rejects.toThrow();
+      expect(fault.terminated).toHaveLength(1);
+      expect(failing.metrics.counter('outbox_published_total')).toBe(0);
+      expect(failing.metrics.counter('outbox_retries_total', { fault: 'call' })).toBe(0);
+      expect(failing.metrics.counter('outbox_commit_failures_total')).toBe(1);
+      // A mensagem foi aceita pelo broker, mas nada foi marcado: attempts e next_attempt_at intactos.
+      const [pending] = await pendingOutbox(sql);
+      expect(pending?.id).toBe(eventId);
+      expect(pending?.attempts).toBe(0);
+      expect(parseTimestamp(pending?.next_attempt_at)).toEqual(parseTimestamp(before?.next_attempt_at));
+
+      // Mesmo pool de uma conexão: o reenvio só acontece se a conexão morta foi descartada.
+      const retry = outboxPublisher({ orm: victimOrm, clock, publisher: sqsPublisher(queueUrl) });
+      expect(await within(drain(retry.batch), 5_000, 'resend on the same pool')).toBe(1);
+      expect(retry.metrics.counter('outbox_published_total')).toBe(1);
+      expect(retry.metrics.counter('outbox_commit_failures_total')).toBe(0);
+      const [row] = await sql(`SELECT attempts, published_at FROM outbox WHERE id = ?`, [eventId]);
+      expect(row?.attempts).toBe(0); // o reenvio não conta como tentativa falha
+      expect(row?.published_at).not.toBeNull();
+
+      // Dois envios do mesmo eventId dentro da janela de 5 min do FIFO: uma mensagem só na fila.
+      await expectFullyPublished(queueUrl, created);
+    } finally {
+      await within(victimOrm.close(true), 3_000, 'orm.close');
+    }
+  }
+
+  test('session killed right after SendMessageBatch: nothing counted, event still pending, resent once (dedup by eventId), pool slot recovered', async () => {
+    await expectCommitFailureRecovered((real) => {
+      const killer = new KillSessionAfterSend(real, sql);
+      return { publisher: killer, terminated: killer.terminated };
+    });
+  });
+
+  test('session killed after every UPDATE, so the COMMIT itself fails: same guarantees', async () => {
+    const terminated: number[] = [];
+    await expectCommitFailureRecovered((real) => ({
+      publisher: real,
+      wrapUow: (uow) => new KillSessionBeforeCommit(uow, sql, terminated),
+      terminated,
+    }));
   });
 });
 

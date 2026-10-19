@@ -44,15 +44,21 @@ export class PublishOutboxBatch {
   ) {}
 
   async execute(): Promise<PublishOutboxBatchResult> {
-    return this.uow.run(async ({ outbox }) => {
-      const messages = await outbox.claimDue(this.clock.now(), this.options.batchSize);
-      let result: PublishOutboxBatchResult = { claimed: 0, published: 0, retried: 0 };
+    // Por lote: ligado só depois que a chamada ao broker terminou (com sucesso, falha parcial ou erro tratado).
+    let sent = false;
+    let tally: { published: number; retriesByFault: Map<string, number> } | undefined;
+    let result: PublishOutboxBatchResult;
+    try {
+      result = await this.uow.run(async ({ outbox }) => {
+        const messages = await outbox.claimDue(this.clock.now(), this.options.batchSize);
+        if (messages.length === 0) return { claimed: 0, published: 0, retried: 0 };
 
-      if (messages.length > 0) {
         const outcome = await this.send(messages);
+        sent = true;
         const failedById = new Map(outcome.failed.map((failure) => [failure.id, failure]));
         const publishedIds = new Set(outcome.published);
         const now = this.clock.now();
+        const retriesByFault = new Map<string, number>();
         let published = 0;
         let retried = 0;
 
@@ -65,20 +71,27 @@ export class PublishOutboxBatch {
             // Falhou, ou o broker não citou a entrada na resposta: trata como falha e tenta de novo.
             message.scheduleRetry(now, this.options.backoff);
             await outbox.saveRetry(message);
-            this.recordEntryFailure(message, failedById.get(message.id));
+            const fault = this.recordEntryFailure(message, failedById.get(message.id));
+            retriesByFault.set(fault, (retriesByFault.get(fault) ?? 0) + 1);
             retried += 1;
           }
         }
-        this.metrics.increment('outbox_published_total', {}, published);
-        result = { claimed: messages.length, published, retried };
-      }
+        tally = { published, retriesByFault };
+        return { claimed: messages.length, published, retried };
+      }, { idleInTransactionTimeoutMs: this.options.idleInTransactionTimeoutMs });
+    } catch (error) {
+      // Envio feito e transação desfeita: as linhas continuam pendentes e serão reenviadas com o mesmo eventId.
+      // O erro original segue sem embrulho (o worker loga e conta outbox_tick_errors_total).
+      if (sent) this.metrics.increment('outbox_commit_failures_total');
+      throw error;
+    }
 
-      // Lag: idade do pendente mais antigo, inclusive os que esperam retry. Zero quando não há pendentes.
-      const oldest = await outbox.oldestPendingOccurredAt();
-      const lagMs = oldest === undefined ? 0 : Math.max(this.clock.now().getTime() - oldest.getTime(), 0);
-      this.metrics.gauge('outbox_lag_seconds', lagMs / 1000);
-      return result;
-    }, { idleInTransactionTimeoutMs: this.options.idleInTransactionTimeoutMs });
+    // Só depois do commit (ARCHITECTURE 6.3): se o lote fosse desfeito, publicados e retries não teriam acontecido.
+    if (tally !== undefined) {
+      this.metrics.increment('outbox_published_total', {}, tally.published);
+      for (const [fault, count] of tally.retriesByFault) this.metrics.increment('outbox_retries_total', { fault }, count);
+    }
+    return result;
   }
 
   /**
@@ -115,7 +128,11 @@ export class PublishOutboxBatch {
     }
   }
 
-  private recordEntryFailure(message: OutboxMessage, failure: PublishFailure | undefined): void {
+  /**
+   * Log e contador de erro do remetente na hora: descrevem a resposta do broker, que aconteceu mesmo que o commit
+   * falhe. Devolve o `fault` para o `outbox_retries_total`, que só é contado depois do commit.
+   */
+  private recordEntryFailure(message: OutboxMessage, failure: PublishFailure | undefined): string {
     const fields = {
       eventId: message.id,
       walletId: message.aggregateId,
@@ -123,7 +140,6 @@ export class PublishOutboxBatch {
       attempts: message.attempts,
       nextAttemptAt: message.nextAttemptAt.toISOString(),
     };
-    this.metrics.increment('outbox_retries_total', { fault: failure?.fault ?? 'call' });
     if (failure?.fault === 'sender') {
       // Erro do remetente: o broker recusou a entrada por causa do que enviamos. Indica bug; retry mesmo assim,
       // para nunca descartar o evento, mas com log de erro e contador próprio para alertar.
@@ -132,5 +148,6 @@ export class PublishOutboxBatch {
     } else if (failure !== undefined) {
       this.logger.warn('Outbox entry failed on broker side (service fault)', { ...fields, code: failure.code });
     }
+    return failure?.fault ?? 'call';
   }
 }

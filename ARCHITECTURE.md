@@ -244,10 +244,22 @@ A alternativa de "reservar" em uma transação e marcar em outra (lease com `loc
 
 **Relógio da aplicação.** O `$now` do claim vem do `Clock`, o mesmo relógio que gravou `occurred_at` e `next_attempt_at`. Os três use cases gravam `next_attempt_at = occurredAt = clock.now()` explicitamente no INSERT, e o `DEFAULT now()` da coluna nunca é usado (teste em `outbox-publisher.test.ts`). Assim o backoff é determinístico nos testes, e não há mistura entre o relógio do banco e o da aplicação.
 
+**Diferença de relógios entre instâncias.** Cada instância grava e compara `next_attempt_at` com o **próprio** relógio. Uma instância adiantada em X segundos reivindica retries (de qualquer instância) X segundos antes do previsto; uma atrasada os adia. O efeito é só no **cronograma**: a correção não depende do relógio (o `SKIP LOCKED` impede envio duplo simultâneo, o FIFO deduplica pelo `eventId`, e nada financeiro é decidido por esse horário). O mesmo vale para o `occurred_at`, então o `outbox_lag_seconds` lido por uma instância com relógio diferente erra pela diferença. Mitigação em produção: NTP nos hosts (diferença típica de milissegundos).
+
+*Alternativa descartada conscientemente:* usar só o relógio do banco (`next_attempt_at <= now()` no claim e `now() + interval` no retry). Daria um relógio único entre instâncias, mas não é uma troca pequena: os três use cases gravam `next_attempt_at = occurredAt` com o `Clock`, o worker de pendentes segue o mesmo esquema, e os testes de backoff, claim e lag usam um relógio manual para serem determinísticos. Trocar só o retry misturaria dois relógios na mesma coluna, o que é pior que o estado atual.
+
 ### 6.3 Entrega at-least-once e resultados ambíguos
 Nada é marcado antes do commit. Se o processo morre depois do envio e antes do commit, ou se o próprio commit falha, a transação é desfeita, a linha continua pendente e outro publisher a reenvia com o mesmo `eventId`.
 
-O FIFO deduplica dentro da janela de **5 minutos**. Depois dela, um reenvio pode gerar duplicata, e por isso **o consumidor tem de ser idempotente**: inbox por `eventId` e `walletVersion` para descartar estado antigo.
+O FIFO deduplica dentro da janela de **5 minutos**, contada a partir do primeiro envio daquele `MessageDeduplicationId`:
+- **reenvio dentro da janela** (o caso normal: o retry após uma falha de commit vem no próximo tick, em milissegundos ou segundos) é descartado pelo broker, que responde sucesso. Isso é testado (`outbox-publisher.test.ts`, "commit failure after the send": uma mensagem só na fila);
+- **reenvio fora da janela** (banco fora do ar por mais de 5 min entre o envio e o commit, ou um backoff que já passou de 5 min) chega duplicado. Isso **não é testado** (exigiria esperar 5 min ou um broker falso); é **contrato documentado**: o consumidor de `wager-events.fifo` deduplica por `eventId` numa inbox persistente e descarta `walletVersion` menor ou igual ao já aplicado (6.4).
+
+**Falha de commit depois do envio (teste).** Postgres e LocalStack reais. Um decorator delega ao publisher (ou ao UoW) real e, por **outra** conexão, roda `pg_terminate_backend` na sessão do lote (identificada por ser a única com `RowShareLock` na outbox, o lock de tabela do `FOR UPDATE`). Duas variantes: logo depois do `SendMessageBatch` (a falha cai no primeiro `UPDATE`) e depois de todos os `UPDATE`s (a falha cai no próprio `COMMIT`). Nas duas: `execute()` rejeita; `outbox_published_total` e `outbox_retries_total` ficam em 0; `outbox_commit_failures_total` = 1; o evento continua pendente com `attempts` e `next_attempt_at` intactos; o reenvio num pool de **uma** conexão termina (a conexão morta foi descartada, sem vazar a vaga, regressão de 5.5) e não incrementa `attempts`; a fila tem a mensagem uma vez.
+
+**Métricas só depois do commit.** `outbox_published_total` e `outbox_retries_total{fault}` são contados em `PublishOutboxBatch` **depois** que o `uow.run` retorna; num caminho de exceção nada é contado, porque o lote desfeito será refeito. Ficam na hora, dentro da transação, o que descreve a **resposta do broker** e é verdade mesmo que o commit falhe: os logs por entrada, `outbox_sender_faults_total` e `outbox_publish_call_failures_total`. Se o `run` rejeita depois que o envio terminou (flag por lote), sobe `outbox_commit_failures_total` e o erro original é relançado sem embrulho. **Prova de mutação** (registrada no commit): mover o incremento de `outbox_published_total` para dentro do callback, antes do commit, quebra a variante do `COMMIT` e o teste de unidade correspondente (o teste seguinte do arquivo também cai, em cascata, pela linha deixada pendente). A variante "depois do envio" sozinha não pegava essa mutação, porque a falha acontece antes do fim do callback, e é por isso que a variante do `COMMIT` existe.
+
+**Publicação parcial (teste de integração).** Um cliente SQS que delega ao LocalStack real tira duas entradas do `SendMessageBatch` e as devolve em `Failed` no formato real (`SenderFault: true` e `false`, com `Code`), passando pelo adaptador de verdade (`fromBatchOutput`). Só a entrada confirmada recebe `published_at`; as falhas recebem `attempts = 1` e `next_attempt_at = now + 1 s`; a fila tem só a confirmada até o retry. A chamada inteira rejeitada (exceção do broker: fila inexistente) leva todas as entradas a retry.
 
 **Timeout é resultado ambíguo**: o broker pode ter aceitado as mensagens e a resposta não chegou. O lote inteiro recebe retry, e a deduplicação resolve o caso.
 
@@ -261,6 +273,8 @@ Uma entrada que não aparece na resposta também recebe retry, e nunca é tratad
 
 ### 6.4 Retry sem limite e reordenação
 O retry não tem limite de tentativas. O backoff vem do domínio (4.6), `1 s · 2^(attempts-1)` com teto de 5 min, e o evento nunca é descartado. Um "DLQ da outbox" tiraria o evento do fluxo normal, e para um evento financeiro isso é perda. Um `attempts` alto aparece no log e nas métricas.
+
+**Evento envenenado.** Um evento que o broker recusa sempre (erro do remetente: corpo inválido, atributo malformado) fica em retry para sempre, a cada 5 min depois de algumas tentativas, com log `error` e `outbox_sender_faults_total{code}` a cada tentativa. Ele não bloqueia os outros: é só uma entrada do lote, e o backoff o tira dos próximos claims. **Limitação:** ninguém o remove do fluxo automaticamente; ele segura o `outbox_lag_seconds` (vira o pendente mais antigo), o que é intencional para gerar alerta, mas exige ação humana (corrigir o código e deixar o retry publicar, ou tirá-lo manualmente com registro). Uma quarentena (coluna `quarantined_at`, fora do claim e do lag) seria a evolução, sem nunca apagar a linha.
 
 **Reordenação.** A ordem por wallet do FIFO é só otimização. Ela quebra em três situações:
 - **falha parcial dentro de um lote**: o evento da versão 2 de uma wallet é aceito e o da versão 1 falha. O da versão 1 sai depois, num retry, já atrás do da versão 2;
@@ -281,9 +295,18 @@ Cada instância roda um `OutboxPublisherWorker` (desligável com `OUTBOX_PUBLISH
 **Limitação do ambiente:** no Windows não há SIGTERM real entre processos; o `kill` do Bun termina o processo à força. O teste de shutdown chama `app.close()`, que percorre os mesmos hooks. O caso de morte abrupta é coberto pelo teste de crash (6.3).
 
 ### 6.6 Outbox lag
-`outbox_lag_seconds` = `now − min(occurred_at)` dos eventos pendentes, incluindo os que esperam retry (zero quando não há nenhum). É medido ao fim de cada tick. Vai para a porta `Metrics`, por enquanto num registro em memória por instância; a exposição em `/metrics` fica para a fatia 9.
+`outbox_lag_seconds` = `now − min(occurred_at)` dos eventos pendentes, incluindo os que esperam retry (zero quando não há nenhum). É calculado **no scrape do `/metrics`** (11.4), com cache de 5 s. Até o commit 4 da fatia 9 o publisher também o media ao fim de cada tick, dentro da transação do lote: uma consulta a cada 500 ms por instância para um gauge que o `/metrics` nem expunha. Foi removido; a inclusão dos pendentes em retry continua testada no teste de publicação parcial.
 
-Contadores: `outbox_published_total`, `outbox_retries_total{fault}`, `outbox_sender_faults_total{code}`, `outbox_publish_call_failures_total{reason}` e `outbox_tick_errors_total`.
+Contadores: `outbox_published_total`, `outbox_retries_total{fault}` (os dois depois do commit, 6.3), `outbox_commit_failures_total`, `outbox_sender_faults_total{code}`, `outbox_publish_call_failures_total{reason}` e `outbox_tick_errors_total`.
+
+### 6.7 Retenção da outbox e da inbox
+As duas tabelas só crescem:
+- **outbox**: toda linha publicada fica com `published_at` preenchido para sempre;
+- **inbox** (seção 7): uma linha por mensagem consumida de `wager-transactions.fifo`.
+
+O que seria limpo: as linhas publicadas da outbox depois de N dias (sete, por exemplo, mais que a janela de investigação de um incidente), e as da inbox depois de um prazo **maior que o maior redelivery possível** (retenção da fila, 4 dias por padrão no SQS, mais folga). Apagar a inbox cedo demais reabre duplicatas: uma mensagem reentregue depois da limpeza seria processada como nova. Mesmo assim, a submissão continua protegida pelo `UNIQUE(idempotency_key)`, que é a defesa principal (a inbox é a segunda camada). A limpeza seria um job em lotes (`DELETE ... WHERE id IN (SELECT ... LIMIT n)`), para não segurar locks longos nem gerar um pico de WAL.
+
+**Por que não está implementado:** prazo, e o risco de uma limpeza errada (a inbox) ser pior que a tabela grande. O crescimento não degrada o caminho quente: o claim usa um índice **parcial** sobre `published_at IS NULL` (6.2), cujo tamanho acompanha só os pendentes; a inbox é consultada pela PK. O custo é disco e o tempo de `VACUUM`.
 
 ## 7. Consumidor SQS de `wager-transactions.fifo`
 

@@ -56,12 +56,19 @@ describe('métricas em src/', () => {
       'retries (consumidor)': 'sqs_consumer_retries_total',
       'retries (pendentes)': 'pending_reference_retries_total',
       'mensagens movidas para a DLQ': 'sqs_consumer_dlq_total',
-      'lag da outbox': 'outbox_lag_seconds',
       'latência HTTP (contagem por status)': 'http_requests_total',
       'latência HTTP (histograma)': 'http_request_duration_seconds',
       'latência do consumidor': 'sqs_consumer_processing_seconds',
     };
     expect(Object.entries(required).filter(([, name]) => !names.has(name)).map(([what]) => what)).toEqual([]);
+  });
+
+  test('lag da outbox: calculado só no scrape do /metrics, nunca gravado pela porta Metrics', async () => {
+    const controller = await Bun.file('src/interface/http/metrics.controller.ts').text();
+    expect(controller).toContain(`const OUTBOX_LAG = 'outbox_lag_seconds';`);
+    expect(controller).toContain('renderGauge(OUTBOX_LAG,');
+    // Um gauge gravado (pelo publisher, por exemplo) ficaria velho e seria excluído da exposição de qualquer forma.
+    expect((await uses()).filter((use) => use.name === 'outbox_lag_seconds')).toEqual([]);
   });
 
   test('o contador antigo de duplicatas do consumidor não existe mais (migrado para wager_duplicates_total)', async () => {

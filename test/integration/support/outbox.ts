@@ -10,6 +10,7 @@ import { PublishOutboxBatch } from '../../../src/application/outbox/publish-outb
 import type { Clock } from '../../../src/application/ports/clock';
 import type { EventPublisher, PublishResult } from '../../../src/application/ports/event-publisher';
 import type { LogFields, StructuredLogger } from '../../../src/application/ports/structured-logger';
+import type { UnitOfWork } from '../../../src/application/ports/unit-of-work';
 import { type SqsSettings, sqsSettingsFromEnv } from '../../../src/config';
 import type { OutboxMessage } from '../../../src/domain/outbox-message';
 import { createSqsClient, SqsEventPublisher } from '../../../src/infrastructure/messaging/sqs-event-publisher';
@@ -135,6 +136,8 @@ export interface PublisherSetup {
   sendTimeoutMs?: number;
   idleInTransactionTimeoutMs?: number;
   batchSize?: number;
+  /** Decorator sobre o UnitOfWork real (ex.: derrubar a sessão antes do COMMIT). */
+  wrapUow?: (real: UnitOfWork) => UnitOfWork;
 }
 
 /** Um publisher como o de uma instância: ORM (pool) próprio, broker e relógio injetados. */
@@ -143,8 +146,9 @@ export function outboxPublisher(setup: PublisherSetup): {
 } {
   const metrics = new InMemoryMetrics();
   const logger = new CapturingStructuredLogger();
+  const real = new MikroOrmUnitOfWork(setup.orm, 10_000);
   const batch = new PublishOutboxBatch(
-    new MikroOrmUnitOfWork(setup.orm, 10_000),
+    setup.wrapUow?.(real) ?? real,
     setup.publisher,
     setup.clock ?? { now: () => new Date() },
     metrics,

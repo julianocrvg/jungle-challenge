@@ -29,7 +29,7 @@ class FakeClock {
   }
 }
 
-class FakeOutbox implements Pick<OutboxRepository, 'claimDue' | 'markPublished' | 'saveRetry' | 'oldestPendingOccurredAt'> {
+class FakeOutbox implements Pick<OutboxRepository, 'claimDue' | 'markPublished' | 'saveRetry'> {
   readonly rows = new Map<string, OutboxMessage>();
   readonly claimedAt: Date[] = [];
 
@@ -40,27 +40,30 @@ class FakeOutbox implements Pick<OutboxRepository, 'claimDue' | 'markPublished' 
     }));
   }
 
+  failClaim: Error | undefined;
+
   async claimDue(now: Date, limit: number): Promise<OutboxMessage[]> {
+    if (this.failClaim !== undefined) throw this.failClaim;
     this.claimedAt.push(now);
     return [...this.rows.values()].filter((m) => m.isDue(now)).slice(0, limit);
   }
 
   async markPublished(): Promise<void> {}
   async saveRetry(): Promise<void> {}
-
-  async oldestPendingOccurredAt(): Promise<Date | undefined> {
-    const pending = [...this.rows.values()].filter((m) => m.isPending()).map((m) => m.occurredAt.getTime());
-    return pending.length === 0 ? undefined : new Date(Math.min(...pending));
-  }
 }
 
 class FakeUnitOfWork implements UnitOfWork {
   readonly options: (TransactionOptions | undefined)[] = [];
   constructor(private readonly outbox: FakeOutbox) {}
 
-  run<T>(work: (repositories: TransactionalRepositories) => Promise<T>, options?: TransactionOptions): Promise<T> {
+  /** Simula a transação morrendo depois do trabalho (o commit falha). */
+  failAfterWork: Error | undefined;
+
+  async run<T>(work: (repositories: TransactionalRepositories) => Promise<T>, options?: TransactionOptions): Promise<T> {
     this.options.push(options);
-    return work({ outbox: this.outbox } as unknown as TransactionalRepositories);
+    const result = await work({ outbox: this.outbox } as unknown as TransactionalRepositories);
+    if (this.failAfterWork !== undefined) throw this.failAfterWork;
+    return result;
   }
 }
 
@@ -97,7 +100,8 @@ describe('PublishOutboxBatch', () => {
     expect(outbox.rows.get('e2')?.publishedAt).toEqual(at(500));
     expect(uow.options).toEqual([{ idleInTransactionTimeoutMs: 15_000 }]);
     expect(metrics.counter('outbox_published_total')).toBe(2);
-    expect(metrics.gaugeValue('outbox_lag_seconds')).toBe(0);
+    // O lag não é mais medido no tick: é calculado no scrape do /metrics (ARCHITECTURE 11.4).
+    expect(metrics.gaugeValue('outbox_lag_seconds')).toBeUndefined();
   });
 
   test('claims with the application clock, not the database clock', async () => {
@@ -122,8 +126,33 @@ describe('PublishOutboxBatch', () => {
     expect(metrics.counter('outbox_retries_total', { fault: 'service' })).toBe(1);
     expect(metrics.counter('outbox_sender_faults_total', { code: 'InternalError' })).toBe(0);
     expect(logger.entries.map((e) => e.level)).toEqual(['warn']);
-    // O pendente mais antigo nasceu 5 s antes do relógio atual.
-    expect(metrics.gaugeValue('outbox_lag_seconds')).toBe(5);
+  });
+
+  test('transaction fails after the send: no published/retry counter, commit failure counted, original error rethrown', async () => {
+    const { outbox, uow, metrics, useCase } = setup(async () => ({
+      published: ['e1'],
+      failed: [{ id: 'e2', fault: 'service', code: 'InternalError', message: 'boom' }],
+    }));
+    outbox.add('e1');
+    outbox.add('e2');
+    const original = new Error('connection terminated');
+    uow.failAfterWork = original;
+
+    await expect(useCase.execute()).rejects.toBe(original); // a mesma instância, sem embrulho
+    expect(metrics.counter('outbox_published_total')).toBe(0);
+    expect(metrics.counter('outbox_retries_total', { fault: 'service' })).toBe(0);
+    expect(metrics.counter('outbox_commit_failures_total')).toBe(1);
+  });
+
+  test('transaction fails before the send (claim): not a commit failure', async () => {
+    const { outbox, uow, metrics, useCase } = setup(allPublished);
+    outbox.add('e1');
+    const original = new Error('db down');
+    outbox.failClaim = original;
+
+    await expect(useCase.execute()).rejects.toBe(original);
+    expect(uow.options).toHaveLength(1);
+    expect(metrics.counter('outbox_commit_failures_total')).toBe(0);
   });
 
   test('sender fault: retried as well, but logged as error with its own counter', async () => {
