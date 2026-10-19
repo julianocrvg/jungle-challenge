@@ -26,6 +26,8 @@ docker compose up -d
 
 O `docker compose up -d` retorna antes de tudo estar pronto; `docker compose ps` mostra `healthy` nos dois quando terminar. Depois de alterar `docker/localstack/init-sqs.sh`: `docker compose up -d --force-recreate localstack`.
 
+**Portas:** o compose ocupa **5433** (PostgreSQL) e **4566** (LocalStack), e a API usa a **3000**. Se já houver outra stack ou outro clone no ar, suba um de cada vez (`docker compose down`, sem `-v`, no outro) ou o `up` falha por porta em uso.
+
 ## Instalar e migrar
 
 ```bash
@@ -214,6 +216,8 @@ bun run test:integration      # Postgres e LocalStack reais
 bun run test:multi-instance   # 3 processos reais da API (cerca de 1 minuto)
 bun test -t "<nome do teste>" # filtro por nome
 ```
+
+Parar a app local antes de `bun test` é uma recomendação, não uma exigência: verificado com a app ligada (`bun run start`), `bun test` e `test:multi-instance` passam, porque os testes usam o banco `wagering_test` e filas temporárias, e a app usa `wagering` e as filas do compose. Parar evita só ruído de CPU e de logs e deixa os tempos mais estáveis.
 
 Os testes de integração usam PostgreSQL e LocalStack **reais** (nada de mocks de banco ou de SQS) e recriam o schema do banco `wagering_test`, sem tocar no banco da aplicação. Os de concorrência usam paralelismo real (`Promise.all` e processos separados via `Bun.spawn`). Todo teste de integração e de concorrência termina verificando `wallet.balance == saldo reconstruído pelo ledger`.
 
