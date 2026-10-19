@@ -287,6 +287,7 @@ describe('request validation', () => {
   test.each([
     ['amount as a number', { money: { amount: 25, currency: 'BRL' } }],
     ['amount with one decimal place', { money: brl('25.5') }],
+    ['negative amount', { money: brl('-1.00') }],
     ['amount in scientific notation', { money: brl('1e3') }],
     ['zero amount on a BET', { money: brl('0.00') }],
     ['OPENING kind', { kind: 'OPENING' }],

@@ -41,6 +41,7 @@ describe('parseWagerTransactionPayload', () => {
   test.each([
     [{ money: { amount: 25, currency: 'BRL' } }],
     [{ money: { amount: '25', currency: 'BRL' } }],
+    [{ money: { amount: '-1.00', currency: 'BRL' } }],
     [{ money: { amount: '1e3', currency: 'BRL' } }],
     [{ money: { amount: '025.00', currency: 'BRL' } }],
     [{ money: { amount: '25.00', currency: 'BRL', scale: 2 } }],

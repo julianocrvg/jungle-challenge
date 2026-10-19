@@ -194,20 +194,21 @@ describe('SQS consumer', () => {
     expect(await count('wager_transactions', 'wallet_id = ?', [ghost.walletId])).toBe(0);
   });
 
-  test('a JSON-number amount and a 3-decimal amount go to the DLQ as INVALID_PAYLOAD (same validator as HTTP): nothing is written', async () => {
+  test('a JSON-number, a 3-decimal and a negative amount go to the DLQ as INVALID_PAYLOAD (same validator as HTTP): nothing is written', async () => {
     const wallet = await insertWallet(sql);
     const group = wallet.walletId;
     const inboxBefore = await count('inbox', 'true', []);
     await sendMessages(client, queues.queueUrl, [
       { body: envelope(betData(wallet, { money: { amount: 25, currency: 'BRL' } })), groupId: group },
       { body: envelope(betData(wallet, { money: { amount: '25.001', currency: 'BRL' } })), groupId: group },
+      { body: envelope(betData(wallet, { money: { amount: '-1.00', currency: 'BRL' } })), groupId: group },
     ]);
     const { metrics } = start();
 
-    const dead = await receiveDeadLetters(client, queues.dlqUrl, 2);
-    expect(dead.map((d) => d.reason)).toEqual(['INVALID_PAYLOAD', 'INVALID_PAYLOAD']);
+    const dead = await receiveDeadLetters(client, queues.dlqUrl, 3);
+    expect(dead.map((d) => d.reason)).toEqual(['INVALID_PAYLOAD', 'INVALID_PAYLOAD', 'INVALID_PAYLOAD']);
     await drained();
-    expect(metrics.counter('sqs_consumer_dlq_total', { reason: 'INVALID_PAYLOAD' })).toBe(2);
+    expect(metrics.counter('sqs_consumer_dlq_total', { reason: 'INVALID_PAYLOAD' })).toBe(3);
     expect(await balanceOf(wallet.walletId)).toBe('100.00');
     expect(await count('wager_transactions', 'wallet_id = ? AND kind = ?', [wallet.walletId, 'BET'])).toBe(0);
     expect(await count('inbox', 'true', [])).toBe(inboxBefore); // inválida antes da transação: nem a inbox grava

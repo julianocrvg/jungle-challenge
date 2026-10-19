@@ -82,6 +82,7 @@ describe('parseWagerMessage', () => {
     [body({ data: { ...data, kind: 'OPENING' } }), 'INVALID_PAYLOAD'],
     [body({ data: { ...data, providerId: 'internal' } }), 'INVALID_PAYLOAD'],
     [body({ data: { ...data, money: { amount: 25, currency: 'BRL' } } }), 'INVALID_PAYLOAD'],
+    [body({ data: { ...data, money: { amount: '-1.00', currency: 'BRL' } } }), 'INVALID_PAYLOAD'],
     [body({ data: { ...data, unknown: true } }), 'INVALID_PAYLOAD'],
     [body({ data: { ...data, idempotencyKey: 'internal:x' } }), 'INVALID_PAYLOAD'],
   ])('rejects %s as %s', (raw, reason) => {
