@@ -30,11 +30,18 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
     if (idleTimeoutMs !== undefined && (!Number.isInteger(idleTimeoutMs) || idleTimeoutMs <= 0)) {
       throw new Error('idleInTransactionTimeoutMs must be a positive integer');
     }
+    const statementTimeoutMs = options.statementTimeoutMs;
+    if (statementTimeoutMs !== undefined && (!Number.isInteger(statementTimeoutMs) || statementTimeoutMs <= 0)) {
+      throw new Error('statementTimeoutMs must be a positive integer');
+    }
     try {
       return await (this.orm.em.fork() as EntityManager).transactional(async (em) => {
         await em.execute(`SET LOCAL lock_timeout = '${this.lockTimeoutMs}ms'`);
         if (idleTimeoutMs !== undefined) {
           await em.execute(`SET LOCAL idle_in_transaction_session_timeout = '${idleTimeoutMs}ms'`);
+        }
+        if (statementTimeoutMs !== undefined) {
+          await em.execute(`SET LOCAL statement_timeout = '${statementTimeoutMs}ms'`);
         }
         return work(sqlRepositories(em));
       });

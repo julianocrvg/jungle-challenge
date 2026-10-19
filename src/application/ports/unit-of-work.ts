@@ -86,6 +86,11 @@ export interface TransactionOptions {
    * aberta (publisher da outbox, ARCHITECTURE 6.2). Se o processo travar, o Postgres derruba a sessão.
    */
   idleInTransactionTimeoutMs?: number;
+  /**
+   * `SET LOCAL statement_timeout`: teto de cada comando desta transação. Para leituras auxiliares (o lag da outbox
+   * no scrape do /metrics, ARCHITECTURE 11.4) que nunca podem segurar uma conexão do pool por mais que isso.
+   */
+  statementTimeoutMs?: number;
 }
 
 export interface UnitOfWork {

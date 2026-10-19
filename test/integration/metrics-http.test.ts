@@ -3,11 +3,12 @@ import type { MikroORM } from '@mikro-orm/postgresql';
 import { ResolvePendingReference } from '../../src/application/wagering/resolve-pending-reference';
 import { DEFAULT_PENDING_REFERENCE_POLICY } from '../../src/domain/pending-reference-policy';
 import { PROMETHEUS_CONTENT_TYPE } from '../../src/infrastructure/metrics/prometheus';
+import { LAG_CACHE_TTL_MS } from '../../src/interface/http/metrics.controller';
 import { parsePrometheus, type ParsedFamily, sampleValue, sumWhere } from '../support/prometheus-parser';
 import { createWalletViaApi, startTestApp, submit, type TestApp, wagerPayload, type WalletBody } from './support/app';
 import { holdWalletLock } from './support/consumer';
 import { closedPort, createTestOrm, type Sql, sqlRunner, walletsDivergingFromLedger } from './support/database';
-import { assertCaptureWired, monetaryLeaks } from './support/logs';
+import { assertCaptureWired, MONETARY, monetaryLeaks } from './support/logs';
 import { ManualClock, waitFor } from './support/outbox';
 
 /*
@@ -50,6 +51,41 @@ async function scrape(app: TestApp): Promise<{ response: Response; text: string;
   return { response, text, families: parsePrometheus(text) };
 }
 
+/**
+ * A regex de valor monetário dos logs (MONETARY) aplicada a todo texto que um label ou nome pode carregar: nome da
+ * família, HELP, nome da série, nomes e valores de label. Ficam fora o `le` dos buckets (0.05, 0.25 são limites de
+ * latência) e o valor numérico de cada amostra (um `_sum` de 0.01 s ou um lag de 5.25 s casariam com a regex). Lança
+ * se não há amostras: um parser que não leu nada faria o teste passar em vazio.
+ */
+function exposedMonetaryText(families: Map<string, ParsedFamily>): string[] {
+  const texts: string[] = [];
+  let samples = 0;
+  for (const family of families.values()) {
+    texts.push(family.name, family.help ?? '');
+    for (const sample of family.samples) {
+      samples += 1;
+      texts.push(sample.name);
+      for (const [name, value] of Object.entries(sample.labels)) if (name !== 'le') texts.push(`${name}="${value}"`, JSON.stringify({ [name]: value }));
+    }
+  }
+  if (samples === 0) throw new Error('no samples parsed: the monetary check would pass vacuously');
+  return texts.filter((text) => MONETARY.test(text));
+}
+
+describe('varredura de valores monetários na exposição', () => {
+  test('pega um label amount="100.00" (e um valor monetário em label de outro nome) e ignora le e valores de amostra', () => {
+    const clean = parsePrometheus([
+      '# HELP x_seconds Latency.', '# TYPE x_seconds histogram',
+      'x_seconds_bucket{le="0.05"} 1', 'x_seconds_bucket{le="+Inf"} 1', 'x_seconds_sum 0.01', 'x_seconds_count 1',
+      '# HELP lag Lag.', '# TYPE lag gauge', 'lag 5.25', '',
+    ].join('\n'));
+    expect(exposedMonetaryText(clean)).toEqual([]);
+    const leaking = parsePrometheus(['# HELP c_total Count.', '# TYPE c_total counter', 'c_total{amount="100.00"} 1', 'c_total{status="25.00"} 1', ''].join('\n'));
+    expect(exposedMonetaryText(leaking)).toEqual(['amount="100.00"', '{"amount":"100.00"}', 'status="25.00"', '{"status":"25.00"}']);
+    expect(() => exposedMonetaryText(parsePrometheus(''))).toThrow('vacuously');
+  });
+});
+
 describe('GET /metrics', () => {
   test('200, sem autenticação, Content-Type do Prometheus e exposição válida para o parser estrito', async () => {
     const app = await start();
@@ -61,8 +97,7 @@ describe('GET /metrics', () => {
     expect(contentType.split(';').map((part) => part.trim()).sort()).toEqual(PROMETHEUS_CONTENT_TYPE.split(';').map((part) => part.trim()).sort());
     expect(text.endsWith('\n')).toBe(true);
     expect(families.has('http_requests_total')).toBe(true);
-    // Os limites dos buckets (0.05, 0.25) parecem decimais, então a regex de log não serve aqui: nenhum valor da wallet (100.00) nem campo money.
-    expect(text).not.toMatch(/100\.00|"money"|"amount"/);
+    expect(exposedMonetaryText(families)).toEqual([]);
     // Cada família declara o TYPE uma única vez.
     for (const family of families.keys()) expect(text.match(new RegExp(`^# TYPE ${family} `, 'gm'))).toHaveLength(1);
   });
@@ -223,12 +258,60 @@ describe('outbox lag no scrape', () => {
     expect(sampleValue((await scrape(app)).families, 'outbox_lag_seconds')).toBe(120);
   });
 
-  test('banco fora do ar: /metrics responde 200, omite o lag e conta a degradação', async () => {
-    const app = await start({ database: { url: `postgres://wagering:wagering@127.0.0.1:${closedPort()}/wagering_test` } });
+  test('banco fora do ar: /metrics responde 200, omite o lag e conta a degradação uma vez por consulta real', async () => {
+    const clock = new ManualClock(new Date());
+    const app = await start({ clock, database: { url: `postgres://wagering:wagering@127.0.0.1:${closedPort()}/wagering_test` } });
     const { response, families } = await scrape(app);
     expect(response.status).toBe(200);
     expect(families.has('outbox_lag_seconds')).toBe(false);
     expect(sampleValue(families, 'metrics_scrape_degraded_total', { source: 'outbox_lag' })).toBe(1);
+    // Dentro do cache, a falha é reaproveitada: o gauge continua omitido e o banco não é consultado de novo.
+    const cached = (await scrape(app)).families;
+    expect(cached.has('outbox_lag_seconds')).toBe(false);
+    expect(sampleValue(cached, 'metrics_scrape_degraded_total', { source: 'outbox_lag' })).toBe(1);
+    clock.advance(LAG_CACHE_TTL_MS);
     expect(sampleValue((await scrape(app)).families, 'metrics_scrape_degraded_total', { source: 'outbox_lag' })).toBe(2);
+  });
+
+  test('cache de 5 s pelo Clock: dentro do prazo a leitura é reaproveitada, mas o lag continua andando', async () => {
+    await sql(`DELETE FROM outbox`);
+    const clock = new ManualClock(new Date());
+    const app = await start({ clock });
+    expect(sampleValue((await scrape(app)).families, 'outbox_lag_seconds')).toBe(0); // lido: nenhuma pendente
+
+    await createWalletViaApi(app, '100.00'); // pendente com occurred_at = t0 + 0
+    clock.advance(LAG_CACHE_TTL_MS - 1);
+    expect(sampleValue((await scrape(app)).families, 'outbox_lag_seconds')).toBe(0); // leitura em cache: ainda "nenhuma"
+    clock.advance(1);
+    expect(sampleValue((await scrape(app)).families, 'outbox_lag_seconds')).toBe(5); // releu: 5 s de idade
+    clock.advance(2_000);
+    expect(sampleValue((await scrape(app)).families, 'outbox_lag_seconds')).toBe(7); // em cache, mas now − oldest anda
+  });
+
+  test('statement_timeout: com a outbox travada, o scrape omite o lag em ~2 s, a sessão é cancelada no banco e scrapes simultâneos dividem a consulta', async () => {
+    const app = await start({ clock: new ManualClock(new Date()) });
+    const { promise: locked, resolve: signalLocked } = Promise.withResolvers<void>();
+    const { promise: released, resolve: release } = Promise.withResolvers<void>();
+    const holder = orm.em.fork().transactional(async (em) => {
+      await em.execute(`LOCK TABLE outbox IN ACCESS EXCLUSIVE MODE`);
+      signalLocked();
+      await released;
+    });
+    try {
+      await locked;
+      const [first, second] = await Promise.all([scrape(app), scrape(app)]);
+      for (const { families } of [first, second]) expect(families.has('outbox_lag_seconds')).toBe(false);
+      // Uma consulta real para os dois scrapes: a degradação conta uma vez.
+      expect(sampleValue(second.families, 'metrics_scrape_degraded_total', { source: 'outbox_lag' })).toBe(1);
+      // A consulta não fica esperando o lock no banco até o lock_timeout (10 s): o statement_timeout a cancela, e a
+      // conexão volta ao pool. Sem o SET LOCAL, ela continuaria em pg_stat_activity aqui.
+      await waitFor(async () => (await sql(
+        `SELECT count(*)::int AS n FROM pg_stat_activity
+         WHERE pid <> pg_backend_pid() AND state = 'active' AND query ILIKE '%min(occurred_at)%'`,
+      ))[0]?.n, (n) => n === 0, 1_500);
+    } finally {
+      release();
+      await holder;
+    }
   });
 });
