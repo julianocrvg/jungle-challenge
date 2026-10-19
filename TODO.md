@@ -71,7 +71,7 @@ Decisões em ARCHITECTURE.md, seção 10.
 - [x] `afterEach` de "nenhum valor monetário em log" estendido aos testes de HTTP, do publisher e do worker
 - [ ] Limitação conhecida (aceita): o varredor de texto `test/unit/logging-audit.test.ts` não é uma AST (o `typescript` 7 não expõe a API de compilador em JS e não se adiciona `typescript`). Ele não enxerga um erro repassado por variável intermediária (`const e2 = error; logger.warn("x", { e2 })`) nem alias de logger com outro nome; a rede principal é a de runtime (`afterEach` de valores monetários e os testes do filtro HTTP)
 - [x] `PublishOutboxBatch`: `outbox_published_total` e `outbox_retries_total` contados depois do commit; `outbox_commit_failures_total`; testes de falha de commit (duas variantes com `pg_terminate_backend`) e de publicação parcial contra Postgres e LocalStack reais; prova de mutação (commit 4; ARCHITECTURE 6.3)
-- [ ] Índice parcial `(occurred_at) WHERE published_at IS NULL` para o `min(occurred_at)` da métrica de outbox lag, que hoje percorre todas as pendentes
+- [x] Índices parciais da outbox (migration 0004; ARCHITECTURE 6.8): `(occurred_at)` para o lag e `(next_attempt_at, id)` para o claim sem Sort, provados com EXPLAIN sobre 55 mil linhas e controle com o schema anterior
 - [x] ARCHITECTURE: retenção da outbox e da inbox (6.7), relógios entre instâncias (6.2), evento envenenado (6.4), janela de deduplicação de 5 min (6.3)
 - [x] `/metrics`: lag com cache de 5 s, single-flight e `statement_timeout` (commit 4; ARCHITECTURE 11.4)
 

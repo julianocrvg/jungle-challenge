@@ -60,7 +60,7 @@ Usei `TEXT + CHECK` em vez de `CREATE TYPE`. Acrescentar um valor vira só troca
 
 ### 2.6 `inbox` e `outbox`
 - `inbox`: PK `(consumer_name, message_id)`. O consumidor faz `INSERT ... ON CONFLICT DO NOTHING RETURNING`, e zero linhas significa duplicata.
-- `outbox`: `id` é o `eventId` e serve de deduplication id no SQS. `next_attempt_at` é `NOT NULL DEFAULT now()`, e não opcional como no esqueleto do enunciado, para que a busca do publisher seja uma comparação simples sobre o índice parcial `outbox_pending_idx (next_attempt_at) WHERE published_at IS NULL`.
+- `outbox`: `id` é o `eventId` e serve de deduplication id no SQS. `next_attempt_at` é `NOT NULL DEFAULT now()`, e não opcional como no esqueleto do enunciado, para que a busca do publisher seja uma comparação simples sobre um índice parcial `WHERE published_at IS NULL` (hoje `outbox_claim_idx (next_attempt_at, id)`, ver 6.8).
 
 ### 2.7 Wallet inexistente: não persistir
 Uma transação para uma `walletId` que não existe **não é persistida**. A FK `wager_transactions.wallet_id` impediria o insert de qualquer forma, e não há linha para travar nem saldo para registrar em `balance_after`. Também não há efeito financeiro a deduplicar: um reenvio depois que a wallet existir é processado normalmente. Tratamento decidido (consta no mapeamento HTTP do CLAUDE.md, linha 404):
@@ -306,7 +306,18 @@ As duas tabelas só crescem:
 
 O que seria limpo: as linhas publicadas da outbox depois de N dias (sete, por exemplo, mais que a janela de investigação de um incidente), e as da inbox depois de um prazo **maior que o maior redelivery possível** (retenção da fila, 4 dias por padrão no SQS, mais folga). Apagar a inbox cedo demais reabre duplicatas: uma mensagem reentregue depois da limpeza seria processada como nova. Mesmo assim, a submissão continua protegida pelo `UNIQUE(idempotency_key)`, que é a defesa principal (a inbox é a segunda camada). A limpeza seria um job em lotes (`DELETE ... WHERE id IN (SELECT ... LIMIT n)`), para não segurar locks longos nem gerar um pico de WAL.
 
-**Por que não está implementado:** prazo, e o risco de uma limpeza errada (a inbox) ser pior que a tabela grande. O crescimento não degrada o caminho quente: o claim usa um índice **parcial** sobre `published_at IS NULL` (6.2), cujo tamanho acompanha só os pendentes; a inbox é consultada pela PK. O custo é disco e o tempo de `VACUUM`.
+**Por que não está implementado:** prazo, e o risco de uma limpeza errada (a inbox) ser pior que a tabela grande. O crescimento não degrada o caminho quente: claim e lag usam índices **parciais** sobre `published_at IS NULL` (6.8), cujo tamanho acompanha só os pendentes; a inbox é consultada pela PK. O custo é disco e o tempo de `VACUUM`.
+
+### 6.8 Índices parciais da outbox (migration 0004)
+Os dois têm o **mesmo predicado** do WHERE das consultas (`published_at IS NULL`): o planner só usa um índice parcial quando o WHERE da consulta implica o predicado, e o tamanho do índice acompanha só os pendentes (as publicadas, que crescem sem limite, 6.7, ficam fora).
+- **`outbox_claim_idx (next_attempt_at, id)`**, no lugar de `outbox_pending_idx (next_attempt_at)`. O claim faz `WHERE published_at IS NULL AND next_attempt_at <= $now ORDER BY next_attempt_at, id LIMIT n FOR UPDATE SKIP LOCKED`. Com só `next_attempt_at` no índice, o empate pelo `id` exigia um `Incremental Sort`; com o `id`, a leitura já sai na ordem do `ORDER BY` e o `LIMIT` para depois de n linhas travadas (`Limit → LockRows → Index Scan using outbox_claim_idx`). O filtro de `next_attempt_at` vira `Index Cond`.
+- **`outbox_pending_occurred_idx (occurred_at)`**, para o `min(occurred_at)` do lag (11.4). O planner reescreve o `min` como "primeira entrada do índice" (`Limit → Index Only Scan`). Antes, era `Bitmap Heap Scan` em todas as pendentes mais `Aggregate`.
+
+As consultas ficam em constantes exportadas (`CLAIM_DUE_SQL`, `OLDEST_PENDING_SQL` em `sql-repositories.ts`), e o teste faz `EXPLAIN` **delas**, não de uma cópia: mudar o WHERE ou o ORDER BY sem mudar o índice quebra o teste.
+
+**Teste (`outbox-indexes.test.ts`).** 50 mil linhas publicadas e 5 mil pendentes (um quinto em retry, com `next_attempt_at` no futuro), via `generate_series`, depois `ANALYZE`. Com poucas linhas o planner prefere `Seq Scan` e o teste não provaria nada. Exige o nome do índice no plano, nenhum nó de `Sort` no claim, nenhum `Seq Scan` na outbox e nenhum `Aggregate` no lag. **Controle:** o mesmo volume com a migration 0004 desfeita mostra `Incremental Sort` no claim e `Aggregate` no lag, ou seja, as asserções dependem dos índices novos. Um segundo teste faz `down` e `up` da 0004, confere `pg_indexes` (com o predicado) e deixa o banco nos índices novos. `TRUNCATE outbox` em `finally`.
+
+**Sem `CONCURRENTLY`.** O MikroORM roda cada migration numa transação, e `CREATE INDEX CONCURRENTLY` não roda dentro de transação. `CREATE INDEX` comum pega lock `SHARE` na tabela, que **bloqueia escritas** (os INSERTs da outbox, ou seja, a submissão inteira) durante a criação. Por isso a migration só é aceitável com o serviço parado, como as demais deste projeto. Com tráfego em produção, seria uma migration fora de transação com `CONCURRENTLY` (e `DROP INDEX CONCURRENTLY` para o antigo), aceitando que uma falha deixa um índice `INVALID` para limpar.
 
 ## 7. Consumidor SQS de `wager-transactions.fifo`
 
@@ -588,7 +599,8 @@ Testes: `request-logging.middleware.test.ts` (unidade: header válido e inválid
 **Custo do lag no scrape.** O scrape não pode competir com o tráfego de negócio pelo pool:
 - **cache de 5 s** (`LAG_CACHE_TTL_MS`, pelo `Clock` da aplicação) da leitura (`min(occurred_at)` das pendentes), e não do lag: o gauge é `now − oldest` na hora do scrape e continua andando entre leituras. Se a linha mais antiga for publicada, o valor fica errado por no máximo 5 s. A falha também fica em cache: com o banco fora do ar, scrapes seguidos não insistem, e `metrics_scrape_degraded_total` conta **consultas** que falharam, não scrapes;
 - **single-flight**: scrapes simultâneos aguardam a mesma consulta (a `Promise` em andamento, limpa em `finally`);
-- **`SET LOCAL statement_timeout = 2 s`** (opção `statementTimeoutMs` do UoW) na transação da leitura: o banco cancela a consulta (por exemplo, esperando um lock de tabela) e a conexão volta ao pool. O `Promise.race` de 2 s continua, porque cobre também a espera por uma conexão do pool, que o `statement_timeout` não alcança.
+- **`SET LOCAL statement_timeout = 2 s`** (opção `statementTimeoutMs` do UoW) na transação da leitura: o banco cancela a consulta (por exemplo, esperando um lock de tabela) e a conexão volta ao pool. O `Promise.race` de 2 s continua, porque cobre também a espera por uma conexão do pool, que o `statement_timeout` não alcança;
+- o índice parcial `outbox_pending_occurred_idx` (6.8) responde o `min` lendo uma entrada do índice, em vez de agregar todas as pendentes.
 
 Teste (`metrics-http.test.ts`): outra conexão segura `LOCK TABLE outbox IN ACCESS EXCLUSIVE MODE`; dois scrapes simultâneos omitem o gauge, a degradação conta 1, e nenhuma sessão continua esperando pela consulta em `pg_stat_activity` (sem o `SET LOCAL` ela esperaria o `lock_timeout` de 10 s; **prova de mutação**: removido, o teste falha).
 

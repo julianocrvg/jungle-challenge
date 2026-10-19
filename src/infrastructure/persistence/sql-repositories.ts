@@ -232,6 +232,17 @@ class SqlLedgerRepository implements LedgerRepository {
   }
 }
 
+/** O claim do publisher (exportado para o EXPLAIN de outbox-indexes.test.ts conferir a consulta real). */
+export const CLAIM_DUE_SQL = `SELECT id, aggregate_id, event_type, payload, occurred_at, attempts, next_attempt_at
+       FROM outbox
+       WHERE published_at IS NULL AND next_attempt_at <= ?
+       ORDER BY next_attempt_at, id
+       LIMIT ?
+       FOR UPDATE SKIP LOCKED`;
+
+/** O lag da outbox (idem). */
+export const OLDEST_PENDING_SQL = `SELECT min(occurred_at) AS oldest FROM outbox WHERE published_at IS NULL`;
+
 class SqlOutboxRepository implements OutboxRepository {
   constructor(private readonly em: EntityManager) {}
 
@@ -249,16 +260,9 @@ class SqlOutboxRepository implements OutboxRepository {
   async claimDue(now: Date, limit: number): Promise<OutboxMessage[]> {
     // SKIP LOCKED: cada publisher pega linhas que nenhum outro travou, sem esperar e sem lock global. O lock
     // vale até o commit do lote, então uma linha nunca está em dois lotes ao mesmo tempo. A busca usa o
-    // índice parcial outbox_pending_idx (next_attempt_at) WHERE published_at IS NULL.
-    const rows = await this.em.execute<Row[]>(
-      `SELECT id, aggregate_id, event_type, payload, occurred_at, attempts, next_attempt_at
-       FROM outbox
-       WHERE published_at IS NULL AND next_attempt_at <= ?
-       ORDER BY next_attempt_at, id
-       LIMIT ?
-       FOR UPDATE SKIP LOCKED`,
-      [now, limit],
-    );
+    // índice parcial outbox_claim_idx (next_attempt_at, id) WHERE published_at IS NULL, na ordem do ORDER BY, sem
+    // Sort (teste em outbox-indexes.test.ts). Mudou o WHERE ou o ORDER BY? Mude o índice junto.
+    const rows = await this.em.execute<Row[]>(CLAIM_DUE_SQL, [now, limit]);
     return rows.map((row) => OutboxMessage.rehydrate({
       id: str(row, 'id'),
       aggregateId: str(row, 'aggregate_id'),
@@ -278,8 +282,9 @@ class SqlOutboxRepository implements OutboxRepository {
     await this.updatePending(message, `attempts = ?, next_attempt_at = ?`, [message.attempts, message.nextAttemptAt]);
   }
 
+  // Índice parcial outbox_pending_occurred_idx (occurred_at) WHERE published_at IS NULL: o min é a primeira entrada.
   async oldestPendingOccurredAt(): Promise<Date | undefined> {
-    const [row] = await this.em.execute<Row[]>(`SELECT min(occurred_at) AS oldest FROM outbox WHERE published_at IS NULL`);
+    const [row] = await this.em.execute<Row[]>(OLDEST_PENDING_SQL);
     return row === undefined ? undefined : optionalDate(row, 'oldest');
   }
 

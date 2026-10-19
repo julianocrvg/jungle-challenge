@@ -80,7 +80,7 @@ O mesmo use case atende HTTP e SQS.
 - `wager_transactions`: `UNIQUE(idempotency_key)`, `UNIQUE(provider_id, external_transaction_id)`, `CHECK` de referência obrigatória para REFUND e ROLLBACK, índice único parcial em `(reference_transaction_id)` contra dupla reversão
 - `wallet_ledger_entries`: `UNIQUE(wallet_id, transaction_id)` e trigger que bloqueia UPDATE e DELETE
 - `inbox`: PK `(consumer_name, message_id)`
-- `outbox`: índice parcial em `(next_attempt_at) WHERE published_at IS NULL`
+- `outbox`: índices parciais `(next_attempt_at, id)` (claim) e `(occurred_at)` (lag) `WHERE published_at IS NULL`
 
 **Outbox:** vários publishers concorrentes com `SELECT ... FOR UPDATE SKIP LOCKED`. Publicar, depois marcar `published_at`. Falha agenda retry com backoff. `eventId` como deduplication id. O consumidor tolera duplicata.
 
