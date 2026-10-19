@@ -9,3 +9,9 @@ export interface StructuredLogger {
 }
 
 export const STRUCTURED_LOGGER = Symbol('StructuredLogger');
+
+/**
+ * Formato aceito para o nome de um erro num log. Única definição: o `describeError` (infraestrutura) e o
+ * `PublishOutboxBatch` (aplicação, que não importa a infraestrutura) usam esta mesma regra.
+ */
+export const SAFE_ERROR_NAME = /^[A-Za-z][\w$]{0,63}$/;

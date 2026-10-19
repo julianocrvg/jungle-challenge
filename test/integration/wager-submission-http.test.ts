@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { createTestOrm, type Sql, sqlRunner, walletsDivergingFromLedger } from './support/database';
-import { monetaryLeaks } from './support/logs';
+import { assertCaptureWired, monetaryLeaks } from './support/logs';
 import {
   createWalletViaApi,
   startTestApp,
@@ -19,6 +19,7 @@ beforeAll(async () => {
   sql = sqlRunner(orm);
   closeOrm = () => orm.close(true);
   api = await startTestApp();
+  assertCaptureWired(api.logger);
 });
 
 afterAll(async () => {

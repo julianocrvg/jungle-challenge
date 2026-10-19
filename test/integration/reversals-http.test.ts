@@ -14,7 +14,7 @@ import {
   type WalletBody,
 } from './support/app';
 
-import { monetaryLeaks } from './support/logs';
+import { assertCaptureWired, monetaryLeaks } from './support/logs';
 
 let api: TestApp;
 let sql: Sql;
@@ -27,6 +27,7 @@ beforeAll(async () => {
   sql = sqlRunner(orm);
   closeOrm = () => orm.close(true);
   api = await startTestApp({ clock });
+  assertCaptureWired(api.logger);
   resolver = api.app.get(ResolvePendingReference);
 });
 

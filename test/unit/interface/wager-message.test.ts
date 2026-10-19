@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  ApplicationError,
+  type ApplicationErrorCode,
   ExternalTransactionIdConflictError,
   IdempotencyKeyConflictError,
   InboxMessageConflictError,
@@ -123,6 +125,58 @@ describe('classifyFailure: o motivo da DLQ nunca deriva de texto de erro', () =>
     ];
     for (const error of errors) {
       expect(JSON.stringify(classifyFailure(error))).not.toContain('123.45');
+    }
+  });
+});
+
+describe('FailureReason é um conjunto fechado e cada ramo da classificação o produz', () => {
+  // `satisfies Record<FailureReason, ...>` quebra a compilação se a união ganhar ou perder um membro sem este teste.
+  const EXPECTED = {
+    INVALID_JSON: 'permanent',
+    INVALID_ENVELOPE: 'permanent',
+    UNKNOWN_MESSAGE_TYPE: 'permanent',
+    INVALID_PAYLOAD: 'permanent',
+    WALLET_NOT_FOUND: 'permanent',
+    WALLET_ALREADY_EXISTS: 'permanent',
+    IDEMPOTENCY_KEY_CONFLICT: 'permanent',
+    EXTERNAL_TRANSACTION_ID_CONFLICT: 'permanent',
+    INBOX_MESSAGE_CONFLICT: 'permanent',
+    TRANSACTION_NOT_FOUND: 'permanent',
+    INVALID_CURSOR: 'permanent',
+    INVALID_LIMIT: 'permanent',
+    SERVICE_UNAVAILABLE: 'transient',
+    UNEXPECTED_ERROR: 'transient',
+  } as const satisfies Record<FailureReason, 'permanent' | 'transient'>;
+
+  class Other extends ApplicationError {
+    constructor(readonly code: ApplicationErrorCode) { super('free text 123.45'); }
+  }
+
+  const cases: Error[] = [
+    new InvalidMessageError('INVALID_JSON', ['123.45']),
+    new InvalidMessageError('INVALID_ENVELOPE', ['123.45']),
+    new InvalidMessageError('UNKNOWN_MESSAGE_TYPE', ['123.45']),
+    new InvalidMessageError('INVALID_PAYLOAD', ['123.45']),
+    new Other('WALLET_NOT_FOUND'),
+    new Other('WALLET_ALREADY_EXISTS'),
+    new Other('IDEMPOTENCY_KEY_CONFLICT'),
+    new Other('EXTERNAL_TRANSACTION_ID_CONFLICT'),
+    new Other('INBOX_MESSAGE_CONFLICT'),
+    new Other('TRANSACTION_NOT_FOUND'),
+    new Other('INVALID_CURSOR'),
+    new Other('INVALID_LIMIT'),
+    new Other('INVALID_PAYLOAD'),
+    new TransientInfrastructureError('123.45'),
+    new TypeError('bug 123.45'),
+  ];
+
+  test('a classificação produz exatamente os membros da união, e só eles', () => {
+    const produced = new Set(cases.map((error) => classifyFailure(error).reason));
+    expect([...produced].sort()).toEqual((Object.keys(EXPECTED) as FailureReason[]).sort());
+    for (const error of cases) {
+      const disposition = classifyFailure(error);
+      expect(disposition.kind).toBe(EXPECTED[disposition.reason]);
+      expect(JSON.stringify(disposition)).not.toContain('123.45');
     }
   });
 });

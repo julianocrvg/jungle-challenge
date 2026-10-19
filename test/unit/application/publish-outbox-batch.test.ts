@@ -9,6 +9,7 @@ import type {
   UnitOfWork,
 } from '../../../src/application/ports/unit-of-work';
 import { OutboxMessage } from '../../../src/domain/outbox-message';
+import { describeError } from '../../../src/infrastructure/logging/describe-error';
 import { InMemoryMetrics } from '../../../src/infrastructure/metrics/in-memory-metrics';
 import { OutboxPublisherWorker } from '../../../src/interface/workers/outbox-publisher.worker';
 
@@ -248,5 +249,28 @@ describe('OutboxPublisherWorker', () => {
     await reachedSecond;
     await worker.stop();
     expect(metrics.counter('outbox_tick_errors_total')).toBe(1);
+  });
+});
+
+describe('nome do erro no log do publisher', () => {
+  // A aplicação (PublishOutboxBatch) e a infraestrutura (describeError) usam a mesma regra (SAFE_ERROR_NAME):
+  // para qualquer nome, ou os dois deixam o nome passar ou os dois o descartam.
+  test.each([
+    'TimeoutError', 'QueueDoesNotExist', '$Dollar', 'A'.repeat(64), 'A'.repeat(65), 'bad name 123.45', '',
+    '1leading', 'Line\nBreak', 'Ünicode', 'with-dash', 'x'.repeat(10) + '.' + 'y',
+  ])('o mesmo conjunto aceito para %p', async (name) => {
+    const error = new Error('x');
+    error.name = name;
+    const { outbox, logger, useCase } = setup(async () => { throw error; });
+    outbox.add('e1');
+    await useCase.execute();
+
+    const logged = logger.entries.find((e) => e.message.includes('publish failed'))?.fields.errorName;
+    const described = describeError(error).errorName;
+    const publisherKeptIt = logged === name;
+    const describeKeptIt = described === name;
+    expect(publisherKeptIt).toBe(describeKeptIt);
+    expect(logged === name || logged === 'unknown').toBe(true);
+    expect(JSON.stringify(logger.entries)).not.toContain('123.45');
   });
 });

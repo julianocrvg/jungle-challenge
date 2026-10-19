@@ -51,6 +51,18 @@ describe('describeError', () => {
     expect(description.frames.length).toBeGreaterThan(0);
     expect(description.frames.join('\n')).not.toContain('100.00');
     expect(description.frames.join('\n')).not.toContain('200.00');
+    // Os frames que sobram são os reais: o primeiro aponta para este arquivo, onde o erro foi construído.
+    expect(description.frames[0]).toContain('describe-error.test.ts');
+    expect(description.frames.some((frame) => frame.includes('a:1:1') || frame.includes('b:2:2'))).toBe(false);
+  });
+
+  test('mensagem multilinha que imita o cabeçalho e frames: só frames reais', () => {
+    const forged = new Error('first line\nError: second\n    at 100.00 (a:1:1)\nTypeError: third\n    at 300.00 (c:3:3)');
+    const { frames } = describeError(forged);
+    expect(frames.length).toBeGreaterThan(0);
+    expect(frames.every((frame) => /\(.+:\d+:\d+\)$|^at .+:\d+:\d+$/.test(frame))).toBe(true);
+    expect(frames.join('\n')).not.toMatch(/100\.00|300\.00|a:1:1|c:3:3/);
+    expect(frames[0]).toContain('describe-error.test.ts');
   });
 
   test('mensagem alterada depois da captura: nunca sai frame forjado (no Bun o cabeçalho acompanha a mensagem)', () => {

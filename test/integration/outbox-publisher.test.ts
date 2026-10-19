@@ -8,7 +8,7 @@ import { createSqsClient } from '../../src/infrastructure/messaging/sqs-event-pu
 import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { parseTimestamp } from '../../src/infrastructure/persistence/timestamps';
 import { CapturingLogger, createWalletViaApi, startTestApp, submit, type TestApp, wagerPayload } from './support/app';
-import { monetaryLeaks } from './support/logs';
+import { assertCaptureWired, monetaryLeaks } from './support/logs';
 import { createTestOrm, type Sql, sqlRunner, TEST_DATABASE_URL, walletsDivergingFromLedger } from './support/database';
 import {
   countById,
@@ -48,6 +48,7 @@ beforeAll(async () => {
   orm = await createTestOrm();
   sql = sqlRunner(orm);
   api = await startApp(); // publisher desligado: os eventos ficam pendentes até o teste publicar
+  assertCaptureWired(logs);
   sqs = createSqsClient(SQS);
 });
 

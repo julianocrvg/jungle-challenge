@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { createTestOrm, type Sql, sqlRunner, walletsDivergingFromLedger } from './support/database';
 import { createWalletViaApi, startTestApp, type TestApp, type WalletBody } from './support/app';
 
-import { monetaryLeaks } from './support/logs';
+import { assertCaptureWired, monetaryLeaks } from './support/logs';
 
 let api: TestApp;
 let sql: Sql;
@@ -13,6 +13,7 @@ beforeAll(async () => {
   sql = sqlRunner(orm);
   closeOrm = () => orm.close(true);
   api = await startTestApp();
+  assertCaptureWired(api.logger);
 });
 
 afterAll(async () => {

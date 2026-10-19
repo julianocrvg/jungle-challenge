@@ -1,4 +1,4 @@
-import type { LogFields } from '../../application/ports/structured-logger';
+import { type LogFields, SAFE_ERROR_NAME } from '../../application/ports/structured-logger';
 import { constraintOf, sqlStateOf } from '../persistence/database-errors';
 
 /*
@@ -7,7 +7,6 @@ import { constraintOf, sqlStateOf } from '../persistence/database-errors';
  * Cada campo só sai se casar com um formato fechado; o que não casa vira ausente.
  */
 
-const NAME = /^[A-Za-z][\w$]{0,63}$/;
 const CODE = /^[A-Z][A-Z0-9_]{1,31}$/;
 const CONSTRAINT = /^[a-z0-9_]{1,63}$/;
 const FRAME = /^\s+at \S/;
@@ -43,7 +42,7 @@ function summarize(thrown: unknown): ErrorSummary {
   const isObject = typeof thrown === 'object' && thrown !== null;
   const rawName = isObject ? read(thrown, 'name') : undefined;
   // Sem stringificar um throwable que não é Error: só o tipo.
-  const errorName = typeof rawName === 'string' && NAME.test(rawName) ? rawName : isObject && thrown instanceof Error ? 'Error' : `NonError_${typeof thrown}`;
+  const errorName = typeof rawName === 'string' && SAFE_ERROR_NAME.test(rawName) ? rawName : isObject && thrown instanceof Error ? 'Error' : `NonError_${typeof thrown}`;
   // Todo SQLSTATE tem ao menos um dígito; `EPIPE` (5 letras) é um code de socket, não um SQLSTATE.
   const candidateState = isObject ? sqlStateOfSafe(thrown) : undefined;
   const sqlState = candidateState !== undefined && /\d/.test(candidateState) ? candidateState : undefined;

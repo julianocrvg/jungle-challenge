@@ -3,7 +3,7 @@ import type { OutboxMessage } from '../../domain/outbox-message';
 import type { Clock } from '../ports/clock';
 import type { EventPublisher, PublishFailure, PublishResult } from '../ports/event-publisher';
 import type { Metrics } from '../ports/metrics';
-import type { StructuredLogger } from '../ports/structured-logger';
+import { SAFE_ERROR_NAME, type StructuredLogger } from '../ports/structured-logger';
 import type { UnitOfWork } from '../ports/unit-of-work';
 
 export interface PublishOutboxBatchOptions {
@@ -101,8 +101,9 @@ export class PublishOutboxBatch {
     } catch (error) {
       const reason = error instanceof PublishTimeoutError ? 'timeout' : 'call_error';
       this.metrics.increment('outbox_publish_call_failures_total', { reason });
-      // A camada de aplicação não importa a infraestrutura (errorFields): só o nome, e só com formato de identificador.
-      const errorName = error instanceof Error && /^[A-Za-z][\w$]{0,63}$/.test(error.name) ? error.name : 'unknown';
+      // A aplicação não importa a infraestrutura (`errorFields`, em infrastructure/logging/describe-error.ts): só o nome,
+      // pela mesma regra (`SAFE_ERROR_NAME`), compartilhada com o describeError.
+      const errorName = error instanceof Error && SAFE_ERROR_NAME.test(error.name) ? error.name : 'unknown';
       this.logger.warn('Outbox batch publish failed; scheduling retry', {
         reason,
         errorName,
