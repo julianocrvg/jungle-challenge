@@ -73,7 +73,7 @@ O mesmo use case atende HTTP e SQS.
 
 **Idempotência:** header `Idempotency-Key` obrigatório (default `{providerId}:{externalTransactionId}`). `payloadHash` = SHA-256 de JSON canônico (chaves ordenadas) apenas dos campos de negócio; header e metadados de transporte ficam fora. Replay devolve a resposta original, incluindo o saldo observado na época (guardar `balance_after` na transação, inclusive para LOSS e REJECTED).
 
-**Money:** `amount` como string decimal com escala fixa de 2, validada por regex estrita. Internamente `decimal.js` ou bigint em centavos. Persistência: `NUMERIC(19,2)` mais coluna `currency` separada, via custom type do MikroORM. O domínio não depende do ORM nem do NestJS. O modelo é multi-moeda mesmo usando só BRL, e conflito de moeda é testado.
+**Money:** `amount` como string decimal com escala fixa de 2, validada por regex estrita. Internamente `decimal.js` ou bigint em centavos. Persistência: `NUMERIC(19,2)` mais coluna `currency` separada, mapeadas à mão nos repositórios SQL (escrita como parâmetro string, leitura com `::text` e `Money.from`). Não há entidades nem custom type do MikroORM (ARCHITECTURE 1.2). O domínio não depende do ORM nem do NestJS. O modelo é multi-moeda mesmo usando só BRL, e conflito de moeda é testado.
 
 **Schema (aplicado no banco):**
 - `wallets`: `UNIQUE(player_id, currency)`, `CHECK(balance >= 0)`

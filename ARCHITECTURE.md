@@ -7,8 +7,19 @@ Registro das decisões técnicas, na ordem em que foram tomadas. Cada entrada di
 ### 1.1 Versões
 Bun 1.4, NestJS 12, MikroORM 7 (`@mikro-orm/postgresql`), PostgreSQL 16 e LocalStack 3.8 (só SQS). A imagem do LocalStack está fixada numa tag para que o ambiente seja reproduzível.
 
-### 1.2 Mapeamento ORM: `EntitySchema` e mappers finos
-O domínio (`src/domain`) é TypeScript puro, sem decorators do ORM nem do NestJS. A persistência usa `EntitySchema` explícito e mappers `toDomain`/`toPersistence`, e reidrata o estado via `rehydrate`. Os comandos críticos usam SQL cru dentro de `em.transactional()`: `INSERT ... ON CONFLICT DO NOTHING`, `SELECT ... FOR UPDATE`, `UPDATE ... WHERE version = ?`. O motivo é deixar visível no código cada lock e cada constraint de que a correção depende, sem esconder isso atrás do Unit of Work.
+### 1.2 Por que MikroORM, e como o Money é mapeado
+**Escolha.** O enunciado aceita MikroORM (preferencial) ou TypeORM, e proíbe Prisma. MikroORM foi escolhido por ser o preferencial e por ter, no mesmo pacote, migrations versionadas com `up` e `down`, `em.transactional()` com um EntityManager isolado por transação (`fork`) e integração com o NestJS (`@mikro-orm/nestjs`).
+
+**Uso real: sem entidades.** O ORM não mapeia nenhuma entidade (`entities: []` em `mikro-orm.config.ts`), não há `EntitySchema` nem custom type, e o Unit of Work do ORM (identity map, flush) e o `LockMode` não são usados: os locks são escritos no SQL. Do MikroORM o projeto usa: o pool de conexões e o driver, a transação (`MikroOrmUnitOfWork` faz `em.fork().transactional(...)` e aplica `SET LOCAL lock_timeout`, e conforme o caso `idle_in_transaction_session_timeout` e `statement_timeout`), `em.execute()` para SQL parametrizado, e o `Migrator` (1.3). Todo comando e toda consulta são **SQL explícito** em `sql-repositories.ts` e `sql-wallet-queries.ts`: `INSERT ... ON CONFLICT ... DO NOTHING`, `SELECT ... FOR UPDATE`, `UPDATE ... WHERE version = ?`, `FOR UPDATE SKIP LOCKED`. O motivo é deixar visível no código cada lock e cada constraint de que a correção depende; com entidades, a ordem e a forma dos statements ficariam a cargo do flush. **Trade-off:** sem o mapeamento do ORM, os mappers são código à mão (linha → `rehydrate` do domínio), e uma coluna nova exige mexer no SQL e no mapper.
+
+**O domínio não conhece o ORM.** `src/domain` é TypeScript puro (seção 4). Os repositórios implementam portas da aplicação e reidratam o estado por `rehydrate`, que não revalida transições.
+
+**Money na persistência.** Coluna `NUMERIC(19,2)` mais coluna `currency CHAR(3)` separada (2.1). O mapeamento está nos repositórios, nos dois sentidos, sem passar por `number`:
+- **escrita:** o valor vai como parâmetro string, `money.toJSON().amount` (por exemplo `"80.00"`), e o Postgres converte o texto para `NUMERIC` de forma exata;
+- **leitura:** a coluna sai como texto no próprio SQL (`balance::text`, `amount::text`) e entra no domínio por `Money.from({ amount, currency })`, que aplica a regex estrita (4.1). A moeda vem da coluna `currency` da linha (ou, no `balance_after`, da wallet; 5.8);
+- **aritmética no banco** (reconciliação, 9.4): soma e diferença em `NUMERIC`, devolvidas como texto.
+
+O `::text` é explícito mesmo que o driver `pg` já devolva `NUMERIC` como string: o contrato não depende de um default do driver.
 
 ### 1.3 Migrations
 O SQL é escrito à mão em `this.addSql()`, porque o gerador do ORM não produz índices parciais, CHECKs compostos nem triggers. As migrations vão numa lista explícita (`migrationsList`) em vez de descoberta por glob, o que dá ordem determinística e funciona com Bun sem ts-node. Cada migration roda numa transação (`transactional`, `allOrNothing`). `bun run migration:down` reverte a última, e o teste de integração faz `down` até zero e depois `up` para provar a reversibilidade.
