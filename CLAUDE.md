@@ -63,9 +63,9 @@ Nunca viole nenhuma destas, nem em testes:
 **Fluxo do use case de submissão (uma única transação SQL):**
 1. Se vier do SQS, inserir na inbox (`ON CONFLICT DO NOTHING`). Se já existia, é duplicata.
 2. Travar a wallet com `FOR UPDATE` **antes** de inserir a transação. Zero linhas: `WALLET_NOT_FOUND`, nada é gravado. (Inserir antes faria a FK pegar `FOR KEY SHARE` na wallet, e duas requisições concorrentes entrariam em deadlock `40P01` ao pedir `FOR UPDATE`; ver ARCHITECTURE 5.1.)
-3. Inserir `wager_transaction` com `ON CONFLICT (idempotency_key) DO NOTHING`. Se conflitou, carregar a existente e comparar `payloadHash`: igual é replay, diferente é conflito.
-4. Resolver a referência (REFUND e ROLLBACK). Ausente leva a `PENDING_REFERENCE`.
-5. Aplicar a regra de negócio, atualizar saldo e `version`, gravar o lançamento no ledger.
+3. Sob o lock, decidir em memória: resolver a referência (REFUND e ROLLBACK; ausente leva a `PENDING_REFERENCE`) e aplicar a regra de negócio. Nada é gravado ainda.
+4. Inserir `wager_transaction` já no estado final com `ON CONFLICT (idempotency_key) DO NOTHING`. Se conflitou, descartar a decisão, carregar a existente e comparar `payloadHash`: igual é replay, diferente é conflito (ARCHITECTURE 5.2).
+5. Se inseriu: gravar o lançamento no ledger e atualizar saldo e `version`.
 6. Gravar eventos na outbox.
 7. Commit. Só depois: ack do SQS e qualquer publicação.
 
