@@ -210,8 +210,7 @@ export class WagerTransactionsConsumer {
         inbox: { consumerName: this.options.consumerName, messageId: parsed.messageId },
       });
       const outcome = result.duplicateDelivery ? 'duplicate' : result.idempotentReplay ? 'replay' : result.transaction.status;
-      if (result.duplicateDelivery) this.metrics.increment('sqs_consumer_duplicates_total', { level: 'inbox' });
-      else if (result.idempotentReplay) this.metrics.increment('sqs_consumer_duplicates_total', { level: 'idempotency' });
+      // Duplicatas são contadas pelo use case (`wager_duplicates_total{source="sqs"}`), depois do commit.
       this.metrics.increment('sqs_consumer_messages_total', { outcome });
       enrichContext({ transactionId: result.transaction.id });
       context = { ...context, transactionId: result.transaction.id, status: result.transaction.status, outcome };

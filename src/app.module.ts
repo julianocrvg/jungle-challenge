@@ -57,6 +57,7 @@ import {
   SqsQueueReadinessProbe,
 } from './infrastructure/health/readiness-probes';
 import { HealthController } from './interface/http/health.controller';
+import { MetricsController } from './interface/http/metrics.controller';
 import { READINESS_PROBES } from './interface/http/readiness';
 import { ProviderTransactionsController, WageringTransactionsController } from './interface/http/wagering-transactions.controller';
 import { GetWagerTransaction } from './application/wagering/get-wager-transaction';
@@ -115,7 +116,7 @@ export class AppModule {
     return {
       module: AppModule,
       imports: [MikroOrmModule.forRoot(createOrmConfig(database.url, { poolMax: database.poolMax }))],
-      controllers: [HealthController, WalletsController, WageringTransactionsController, ProviderTransactionsController],
+      controllers: [HealthController, MetricsController, WalletsController, WageringTransactionsController, ProviderTransactionsController],
       providers: [
         { provide: ID_GENERATOR, useValue: options.idGenerator ?? new BunIdGenerator() },
         { provide: CLOCK, useValue: options.clock ?? new SystemClock() },
@@ -126,8 +127,8 @@ export class AppModule {
         },
         {
           provide: UNIT_OF_WORK,
-          useFactory: (orm: MikroORM) => new MikroOrmUnitOfWork(orm, database.lockTimeoutMs),
-          inject: [MikroORM],
+          useFactory: (orm: MikroORM, metrics: Metrics) => new MikroOrmUnitOfWork(orm, database.lockTimeoutMs, metrics),
+          inject: [MikroORM, METRICS],
         },
         { provide: GetWagerTransaction, useFactory: (uow: UnitOfWork) => new GetWagerTransaction(uow), inject: [UNIT_OF_WORK] },
         {
@@ -154,15 +155,15 @@ export class AppModule {
         },
         {
           provide: SubmitWagerTransaction,
-          useFactory: (uow: UnitOfWork, ids: IdGenerator, clock: Clock) =>
-            new SubmitWagerTransaction(uow, ids, clock, pendingPolicy),
-          inject: useCaseDeps,
+          useFactory: (uow: UnitOfWork, ids: IdGenerator, clock: Clock, metrics: Metrics) =>
+            new SubmitWagerTransaction(uow, ids, clock, pendingPolicy, metrics),
+          inject: [...useCaseDeps, METRICS],
         },
         {
           provide: ResolvePendingReference,
-          useFactory: (uow: UnitOfWork, ids: IdGenerator, clock: Clock) =>
-            new ResolvePendingReference(uow, ids, clock, pendingPolicy),
-          inject: useCaseDeps,
+          useFactory: (uow: UnitOfWork, ids: IdGenerator, clock: Clock, metrics: Metrics) =>
+            new ResolvePendingReference(uow, ids, clock, pendingPolicy, metrics),
+          inject: [...useCaseDeps, METRICS],
         },
         {
           provide: PendingReferenceQueries,

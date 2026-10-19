@@ -102,7 +102,7 @@ describe('SQS consumer', () => {
     await sendMessages(client, queues.queueUrl, Array.from({ length: 10 }, () => ({ body, groupId: wallet.walletId })));
 
     const { metrics } = start();
-    await waitFor(async () => metrics.counter('sqs_consumer_duplicates_total', { level: 'inbox' }), (n) => n === 9);
+    await waitFor(async () => metrics.counter('wager_duplicates_total', { source: 'sqs', level: 'inbox' }), (n) => n === 9);
     await drained();
 
     expect(metrics.counter('sqs_consumer_messages_total', { outcome: 'PROCESSED' })).toBe(1);
@@ -121,10 +121,10 @@ describe('SQS consumer', () => {
     ]);
 
     const { metrics } = start();
-    await waitFor(async () => metrics.counter('sqs_consumer_duplicates_total', { level: 'idempotency' }), (n) => n === 1);
+    await waitFor(async () => metrics.counter('wager_duplicates_total', { source: 'sqs', level: 'idempotency_key' }), (n) => n === 1);
     await drained();
 
-    expect(metrics.counter('sqs_consumer_duplicates_total', { level: 'inbox' })).toBe(0);
+    expect(metrics.counter('wager_duplicates_total', { source: 'sqs', level: 'inbox' })).toBe(0);
     expect(metrics.counter('sqs_consumer_messages_total', { outcome: 'replay' })).toBe(1);
     expect(await ledgerEntries(wallet.walletId)).toBe(1);
     expect(await balanceOf(wallet.walletId)).toBe('90.00');
@@ -142,7 +142,7 @@ describe('SQS consumer', () => {
       const message = envelope(data);
       await sendMessages(client, queues.queueUrl, [{ body: message, groupId: wallet.walletId }]);
       const { metrics } = start();
-      await waitFor(async () => metrics.counter('sqs_consumer_duplicates_total', { level: 'idempotency' }), (n) => n === 1);
+      await waitFor(async () => metrics.counter('wager_duplicates_total', { source: 'sqs', level: 'idempotency_key' }), (n) => n === 1);
       await drained();
 
       expect(await count('inbox', 'message_id = ?', [message.messageId])).toBe(1);

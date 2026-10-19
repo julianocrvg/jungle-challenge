@@ -5,7 +5,7 @@ import { createSqsClient } from '../../src/infrastructure/messaging/sqs-event-pu
 import { READINESS_TIMEOUT_MS } from '../../src/interface/http/readiness';
 import { startTestApp, type TestApp } from './support/app';
 import { createTempQueuePair, MAX_ATTEMPTS, type QueuePair } from './support/consumer';
-import { createTestOrm } from './support/database';
+import { closedPort, createTestOrm } from './support/database';
 import { SQS } from './support/outbox';
 
 /*
@@ -42,14 +42,6 @@ async function get(app: TestApp, path: string): Promise<{ status: number; body: 
   const started = Date.now();
   const response = await fetch(`${app.baseUrl}${path}`);
   return { status: response.status, body: (await response.json()) as Record<string, unknown>, ms: Date.now() - started };
-}
-
-/** Uma porta onde ninguém escuta: abre um listener numa porta livre e o fecha. */
-function closedPort(): number {
-  const server = Bun.listen({ hostname: '127.0.0.1', port: 0, socket: { data() {} } });
-  const { port } = server;
-  server.stop(true);
-  return port;
 }
 
 describe('health endpoints', () => {

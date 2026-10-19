@@ -1,9 +1,13 @@
 import type { MikroORM } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/postgresql';
 import { TransientInfrastructureError } from '../../application/errors';
+import { type Metrics, NOOP_METRICS } from '../../application/ports/metrics';
 import type { TransactionalRepositories, TransactionOptions, UnitOfWork } from '../../application/ports/unit-of-work';
-import { isTransientDatabaseError } from './database-errors';
+import { isTransientDatabaseError, sqlStateOf } from './database-errors';
 import { sqlRepositories } from './sql-repositories';
+
+const LOCK_TIMEOUT = '55P03';
+const DEADLOCK = '40P01';
 
 /**
  * Cada `run` é uma transação SQL num EntityManager isolado (fork), com conexão própria do pool.
@@ -13,6 +17,7 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
   constructor(
     private readonly orm: MikroORM,
     private readonly lockTimeoutMs: number,
+    private readonly metrics: Metrics = NOOP_METRICS,
   ) {
     // SET não aceita parâmetro ligado; o valor é interpolado, então só um inteiro positivo é aceito.
     if (!Number.isInteger(lockTimeoutMs) || lockTimeoutMs <= 0) {
@@ -34,6 +39,10 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
         return work(sqlRepositories(em));
       });
     } catch (error) {
+      // O único ponto onde o erro do banco é classificado: um conflito de lock conta UMA vez, aqui. HTTP, consumidor e
+      // workers só veem o TransientInfrastructureError já embrulhado (não contam de novo).
+      const state = sqlStateOf(error);
+      if (state === LOCK_TIMEOUT || state === DEADLOCK) this.metrics.increment('db_lock_conflicts_total', { sqlstate: state });
       if (isTransientDatabaseError(error)) {
         throw new TransientInfrastructureError('Database temporarily unavailable', { cause: error });
       }

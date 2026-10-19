@@ -65,7 +65,8 @@ Decisões em ARCHITECTURE.md, seção 10.
 - [x] `multi-instance.test.ts` (`bun run test:multi-instance`): 3 processos reais; 2 × 80 em 20 wallets, mesma aposta 50 vezes, wallets distintas, REFUND antes da BET em instâncias diferentes, crash com trabalho em voo, reinício completo com redeliveries
 
 ## Fatia 9 (observações herdadas das fatias 6 a 8)
-- [ ] Logs JSON de verdade: hoje o Nest imprime texto com o JSON embutido; a varredura de `multi-instance.test.ts` procura padrões no texto
+- [x] Logs JSON de verdade (commits 2a e 2b; ARCHITECTURE 11.2 e 11.3)
+- [x] `GET /metrics` e a lista mínima de métricas (commit 3; ARCHITECTURE 11.4). Pendente: a profundidade da DLQ não é exposta (só o contador do que a instância moveu)
 - [x] Auditoria dos pontos de log (ARCHITECTURE 11.2), feita no commit 2a. Pontos auditados: filtro de exceções HTTP (`HttpErrorFilter`: deixou de logar `message` e `stack`; 503 com mensagem fixa), publisher da outbox (`OutboxPublisherWorker`, `PublishOutboxBatch`: nome validado), worker de pendentes (4 pontos), consumidor SQS (6 pontos; `failureDetail` da DLQ agora é um motivo fechado), `/health/ready` (nome do erro), reconciliação (só ids e diferença). Todos via `errorFields`
 - [x] `afterEach` de "nenhum valor monetário em log" estendido aos testes de HTTP, do publisher e do worker
 - [ ] Limitação conhecida (aceita): o varredor de texto `test/unit/logging-audit.test.ts` não é uma AST (o `typescript` 7 não expõe a API de compilador em JS e não se adiciona `typescript`). Ele não enxerga um erro repassado por variável intermediária (`const e2 = error; logger.warn("x", { e2 })`) nem alias de logger com outro nome; a rede principal é a de runtime (`afterEach` de valores monetários e os testes do filtro HTTP)

@@ -224,8 +224,8 @@ export function buildConsumer(setup: ConsumerSetup): {
   const metrics = new InMemoryMetrics();
   const logger = new CapturingStructuredLogger();
   const real = new SubmitWagerTransaction(
-    new MikroOrmUnitOfWork(setup.orm, setup.lockTimeoutMs ?? 10_000), new BunIdGenerator(), { now: () => new Date() },
-    DEFAULT_PENDING_REFERENCE_POLICY,
+    new MikroOrmUnitOfWork(setup.orm, setup.lockTimeoutMs ?? 10_000, metrics), new BunIdGenerator(), { now: () => new Date() },
+    DEFAULT_PENDING_REFERENCE_POLICY, metrics,
   );
   const submit = setup.wrapSubmit?.(real) ?? real;
   const sqsQueue = new SqsMessageQueue(setup.client, setup.queues.queueUrl, setup.queues.dlqUrl);

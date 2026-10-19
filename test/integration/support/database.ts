@@ -70,3 +70,11 @@ export async function walletsDivergingFromLedger(sql: Sql): Promise<Record<strin
     ) l ON l.wallet_id = w.id
     WHERE w.balance <> COALESCE(l.calculated, 0)`);
 }
+
+/** Uma porta onde ninguém escuta: abre um listener numa porta livre e o fecha. */
+export function closedPort(): number {
+  const server = Bun.listen({ hostname: '127.0.0.1', port: 0, socket: { data() {} } });
+  const { port } = server;
+  server.stop(true);
+  return port;
+}

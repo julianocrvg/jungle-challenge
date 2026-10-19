@@ -66,7 +66,7 @@ describe('SQS consumer crash between commit and ack', () => {
     const { consumer, metrics } = buildConsumer({ orm, client, queues });
     consumer.start();
     try {
-      await waitFor(async () => metrics.counter('sqs_consumer_duplicates_total', { level: 'inbox' }), (n) => n === 1, 20_000);
+      await waitFor(async () => metrics.counter('wager_duplicates_total', { source: 'sqs', level: 'inbox' }), (n) => n === 1, 20_000);
       await waitFor(() => queueDepth(client, queues.queueUrl), (n) => n === 0);
     } finally {
       await consumer.stop();

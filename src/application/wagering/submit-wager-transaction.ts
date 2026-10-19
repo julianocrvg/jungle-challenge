@@ -6,11 +6,13 @@ import { OutboxMessage } from '../../domain/outbox-message';
 import { nextReferenceAttemptAt, type PendingReferencePolicy } from '../../domain/pending-reference-policy';
 import { WagerTransaction, type WagerTransactionKind } from '../../domain/wager-transaction';
 import {
-  IdempotencyKeyConflictError, InboxMessageConflictError, InvalidCommandError, WalletNotFoundError,
+  ExternalTransactionIdConflictError, IdempotencyKeyConflictError, InboxMessageConflictError, InvalidCommandError,
+  WalletNotFoundError,
 } from '../errors';
 import { type CanonicalValue, payloadHash } from '../payload-hash';
 import type { Clock } from '../ports/clock';
 import type { IdGenerator } from '../ports/id-generator';
+import { type Metrics, NOOP_METRICS } from '../ports/metrics';
 import type { TransactionalRepositories, UnitOfWork } from '../ports/unit-of-work';
 import { decideUnderLock, wagerEvents } from './wager-rules';
 
@@ -96,9 +98,48 @@ export class SubmitWagerTransaction {
     private readonly ids: IdGenerator,
     private readonly clock: Clock,
     private readonly pendingPolicy: PendingReferencePolicy,
+    private readonly metrics: Metrics = NOOP_METRICS,
   ) {}
 
   async execute(command: SubmitWagerTransactionCommand): Promise<SubmissionResult> {
+    let result: SubmissionResult;
+    try {
+      result = await this.perform(command);
+    } catch (error) {
+      this.countConflict(error);
+      throw error;
+    }
+    // Depois do commit (a transação de `perform` já terminou): um rollback nunca chega aqui.
+    this.countOutcome(command, result);
+    return result;
+  }
+
+  /** 409 de idempotência: a mesma chave, id externo ou messageId com conteúdo diferente (não é duplicata). */
+  private countConflict(error: unknown): void {
+    if (error instanceof IdempotencyKeyConflictError) this.metrics.increment('wager_idempotency_conflicts_total', { kind: 'idempotency_key' });
+    else if (error instanceof ExternalTransactionIdConflictError) this.metrics.increment('wager_idempotency_conflicts_total', { kind: 'external_id' });
+    else if (error instanceof InboxMessageConflictError) this.metrics.increment('wager_idempotency_conflicts_total', { kind: 'inbox' });
+  }
+
+  /**
+   * Duplicata = replay com a mesma chave e o mesmo payload (inclui perder a corrida do ON CONFLICT) ou a mesma
+   * mensagem da fila entregue de novo. Uma duplicata NÃO conta como transação nova. Só a transação que
+   * acabou de entrar em um status conta em `wager_transactions_total` (ARCHITECTURE 11.4).
+   */
+  private countOutcome(command: SubmitWagerTransactionCommand, result: SubmissionResult): void {
+    const source = command.inbox === undefined ? 'http' : 'sqs';
+    if (result.duplicateDelivery) {
+      this.metrics.increment('wager_duplicates_total', { source, level: 'inbox' });
+    } else if (result.idempotentReplay) {
+      this.metrics.increment('wager_duplicates_total', { source, level: 'idempotency_key' });
+    } else {
+      const { status, kind, failureCode } = result.transaction;
+      this.metrics.increment('wager_transactions_total', { status, kind });
+      if (failureCode !== undefined) this.metrics.increment('wager_rejections_total', { failure_code: failureCode });
+    }
+  }
+
+  private async perform(command: SubmitWagerTransactionCommand): Promise<SubmissionResult> {
     // O hash vem antes de tudo, do payload como chegou: nenhuma normalização do domínio entra nele.
     const hash = hashWagerPayload(command.payload);
     const now = this.clock.now();

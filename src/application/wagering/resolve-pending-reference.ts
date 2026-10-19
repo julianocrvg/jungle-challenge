@@ -8,6 +8,7 @@ import {
 import { type WagerTransaction, WagerTransactionStatus } from '../../domain/wager-transaction';
 import type { Clock } from '../ports/clock';
 import type { IdGenerator } from '../ports/id-generator';
+import { type Metrics, NOOP_METRICS } from '../ports/metrics';
 import type { UnitOfWork } from '../ports/unit-of-work';
 import { decideUnderLock, wagerEvents } from './wager-rules';
 
@@ -42,9 +43,22 @@ export class ResolvePendingReference {
     private readonly ids: IdGenerator,
     private readonly clock: Clock,
     private readonly policy: PendingReferencePolicy,
+    private readonly metrics: Metrics = NOOP_METRICS,
   ) {}
 
   async execute(transactionId: string, correlationId: string = this.ids.next()): Promise<ResolveOutcome> {
+    const result = await this.perform(transactionId, correlationId);
+    // Depois do commit. Quem sai de PENDING_REFERENCE para PROCESSED ou REJECTED conta como transição de status
+    // (a entrada em PENDING_REFERENCE foi contada pela submissão); `still_pending` e `noop` não mudam status.
+    if (result.outcome === 'resolved' || result.outcome === 'expired') {
+      const { status, kind, failureCode } = result.transaction;
+      this.metrics.increment('wager_transactions_total', { status, kind });
+      if (failureCode !== undefined) this.metrics.increment('wager_rejections_total', { failure_code: failureCode });
+    }
+    return result;
+  }
+
+  private async perform(transactionId: string, correlationId: string): Promise<ResolveOutcome> {
     return this.unitOfWork.run(async (repositories) => {
       const unlocked = await repositories.transactions.findById(transactionId);
       if (unlocked === undefined) return { outcome: 'noop', reason: 'not_found', transaction: undefined };

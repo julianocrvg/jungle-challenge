@@ -106,8 +106,8 @@ describe('SQS consumer under concurrency', () => {
     expect(handledBy.reduce((a, b) => a + b, 0)).toBe(outgoing.length);
     // Os três processos trabalharam de fato (não é um consumidor só com dois parados).
     expect(handledBy.filter((n) => n > 0).length).toBeGreaterThanOrEqual(2);
-    expect(total('sqs_consumer_duplicates_total{level="inbox"}')).toBe(20);
-    expect(total('sqs_consumer_duplicates_total{level="idempotency"}')).toBe(5);
+    expect(total('wager_duplicates_total{level="inbox",source="sqs"}')).toBe(20);
+    expect(total('wager_duplicates_total{level="idempotency_key",source="sqs"}')).toBe(5);
     expect(total('sqs_consumer_messages_total{outcome="PROCESSED"}')).toBe(20);
     expect(total('sqs_consumer_messages_total{outcome="REJECTED"}')).toBe(20);
     expect(Object.keys(metrics.reduce((a, m) => ({ ...a, ...m }), {})).filter((k) => k.includes('dlq') || k.includes('UNEXPECTED'))).toEqual([]);

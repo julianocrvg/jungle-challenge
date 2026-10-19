@@ -7,6 +7,7 @@ import { JsonLogger } from './infrastructure/logging/json-logger';
 import { HttpErrorFilter } from './interface/http/http-error.filter';
 import { requestLoggingMiddleware } from './interface/http/request-logging.middleware';
 import { ID_GENERATOR, type IdGenerator } from './application/ports/id-generator';
+import { METRICS, type Metrics } from './application/ports/metrics';
 
 export interface CreateAppOptions extends AppOptions {
   logger?: LoggerService | LogLevel[] | false;
@@ -26,7 +27,7 @@ export async function createApp(options: CreateAppOptions = {}): Promise<INestAp
     throw new Error('requestLoggingMiddleware assumes the Express adapter (route template in request.route.path)');
   }
   const ids = app.get<IdGenerator>(ID_GENERATOR);
-  app.use(requestLoggingMiddleware(() => ids.next()));
+  app.use(requestLoggingMiddleware(() => ids.next(), app.get<Metrics>(METRICS)));
   // Toda resposta diz qual instância a atendeu, inclusive as de erro (ARCHITECTURE 10.2).
   app.use((_request: unknown, response: HeaderResponse, next: () => void) => {
     response.setHeader('X-Instance-Id', instanceId);
