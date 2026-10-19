@@ -785,7 +785,7 @@ Caminhos relativos a `test/`. "Lacuna" marca o que não está coberto como pedid
 **Outras lacunas, sem esconder:**
 - SIGTERM real entre processos não é testado (no Windows o `kill` é forçado); o shutdown gracioso é testado por `app.close()`, que percorre os mesmos hooks (6.5, 7.7, 10.2).
 - O reenvio da outbox **fora** da janela de 5 min de deduplicação do FIFO não é testado (exigiria esperar 5 min); é contrato documentado para quem consome os eventos (6.3).
-- A eliminatória 1 é varrida só em `src/domain` (`purity.test.ts`); fora do domínio a proteção é a revisão e o SQL com `::text`.
+- A eliminatória 1 tem duas varreduras: `purity.test.ts` (`src/domain`, conversões proibidas em qualquer lugar) e `money-float-scan.test.ts` (`src/` inteiro, heurística de proximidade: `number`, `parseFloat`, `Number(`, `.toFixed(` ou `Math.` na linha ou nas vizinhas de `amount`, `balance`, `money`, `price`, `stake` ou `payout`). A heurística **não vê** dinheiro com outro nome nem fluxo por variável intermediária; nesses casos a proteção é a revisão e o SQL com `::text`.
 
 ## 15. Limitações conhecidas
 
