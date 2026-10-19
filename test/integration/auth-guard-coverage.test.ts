@@ -15,7 +15,7 @@ let api: TestApp;
 
 beforeAll(async () => {
   api = await startTestApp();
-});
+}, 30_000);
 
 afterAll(async () => {
   await api?.close();
@@ -33,6 +33,7 @@ test('todo controller fora da allowlist usa o AuthGuard no nível da classe', ()
   const names = controllers.map((c) => c.name);
 
   // Sanidade da descoberta: sem isso, um container vazio passaria o teste.
+  expect(controllers.length).toBeGreaterThan(0);
   expect(names).toContain('HealthController');
   expect(names).toContain('WalletsController');
   expect(names).toContain('WageringTransactionsController');
