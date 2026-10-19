@@ -1,3 +1,4 @@
+import { enrichContext } from '../../infrastructure/logging/request-context';
 import { Body, Controller, Get, Headers, HttpCode, Inject, Param, Post, Query, UseGuards } from '@nestjs/common';
 import { ID_GENERATOR, type IdGenerator } from '../../application/ports/id-generator';
 import { CreateWallet } from '../../application/wallets/create-wallet';
@@ -41,12 +42,15 @@ export class WalletsController {
       ...request,
       correlationId: correlationIdFrom(correlationHeader, () => this.ids.next()),
     });
+    enrichContext({ walletId: wallet.id });
     return { id: wallet.id, playerId: wallet.playerId, balance: wallet.balance.toJSON(), version: wallet.version };
   }
 
   @Get(':walletId')
   async get(@Param('walletId') walletId: string): Promise<WalletResponse> {
-    return this.getWallet.execute(parseUuidParam(walletId, 'walletId'));
+    const id = parseUuidParam(walletId, 'walletId');
+    enrichContext({ walletId: id });
+    return this.getWallet.execute(id);
   }
 
   @Get(':walletId/ledger')
@@ -55,7 +59,9 @@ export class WalletsController {
     @Query('cursor') cursor?: unknown,
     @Query('limit') limit?: unknown,
   ): Promise<LedgerResponse> {
-    return this.getLedgerPage.execute(parseUuidParam(walletId, 'walletId'), cursor, limit);
+    const id = parseUuidParam(walletId, 'walletId');
+    enrichContext({ walletId: id });
+    return this.getLedgerPage.execute(id, cursor, limit);
   }
 
   /**
@@ -68,8 +74,10 @@ export class WalletsController {
     @Param('walletId') walletId: string,
     @Headers('x-correlation-id') correlationHeader?: string,
   ): Promise<ReconciliationReport> {
+    const id = parseUuidParam(walletId, 'walletId');
+    enrichContext({ walletId: id });
     return this.reconcileWallet.execute(
-      parseUuidParam(walletId, 'walletId'),
+      id,
       correlationIdFrom(correlationHeader, () => this.ids.next()),
     );
   }

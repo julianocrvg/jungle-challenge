@@ -8,6 +8,7 @@ import {
 } from '@aws-sdk/client-sqs';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import type { MessageQueue } from '../../../src/application/ports/message-queue';
+import type { StructuredLogger } from '../../../src/application/ports/structured-logger';
 import { SubmitWagerTransaction } from '../../../src/application/wagering/submit-wager-transaction';
 import { DEFAULT_PENDING_REFERENCE_POLICY } from '../../../src/domain/pending-reference-policy';
 import { BunIdGenerator } from '../../../src/infrastructure/id/bun-id-generator';
@@ -164,6 +165,8 @@ export interface ConsumerSetup {
   /** Para injetar falhas: recebe o use case real e devolve o que o consumidor vai chamar. */
   wrapSubmit?: (submit: SubmitWagerTransaction) => SubmitWagerTransaction;
   wrapQueue?: (queue: MessageQueue) => MessageQueue;
+  /** Troca o logger do consumidor (por padrão, o `CapturingStructuredLogger` devolvido). Para conferir o contexto de log. */
+  structuredLogger?: StructuredLogger;
 }
 
 /** Coleta as linhas do stdout de um processo filho desde o início, sem perder nenhuma entre esperas. */
@@ -227,6 +230,6 @@ export function buildConsumer(setup: ConsumerSetup): {
   const submit = setup.wrapSubmit?.(real) ?? real;
   const sqsQueue = new SqsMessageQueue(setup.client, setup.queues.queueUrl, setup.queues.dlqUrl);
   const queue = setup.wrapQueue?.(sqsQueue) ?? sqsQueue;
-  const consumer = new WagerTransactionsConsumer(submit, queue, metrics, logger, { ...TEST_CONSUMER_OPTIONS, ...setup.options });
+  const consumer = new WagerTransactionsConsumer(submit, queue, metrics, setup.structuredLogger ?? logger, { ...TEST_CONSUMER_OPTIONS, ...setup.options });
   return { consumer, metrics, logger, submit: real };
 }

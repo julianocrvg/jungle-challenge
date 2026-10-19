@@ -87,7 +87,9 @@ describe('health endpoints', () => {
     expect(JSON.stringify(ready.body)).not.toContain('does-not-exist');
     const warnings = app.logger.entries.filter((e) => e.level === 'warn' && e.message.includes('readiness'));
     expect(warnings.length).toBe(1);
-    expect(JSON.parse(warnings[0]!.message)).toEqual({ message: 'readiness check failed', probe: 'sqs-events', error: expect.any(String) });
+    expect(JSON.parse(warnings[0]!.message)).toEqual({
+      message: 'readiness check failed', probe: 'sqs-events', error: 'QueueDoesNotExist', correlationId: expect.any(String),
+    });
     expect(await get(app, '/health/live')).toMatchObject({ status: 200 });
   });
 

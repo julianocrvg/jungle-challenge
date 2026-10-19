@@ -1,3 +1,4 @@
+import { currentContext, isValidCorrelationId } from '../../infrastructure/logging/request-context';
 import type { WagerTransactionPayload } from '../../application/wagering/submit-wager-transaction';
 import { DomainError } from '../../domain/errors';
 import { Money, type MoneyProps } from '../../domain/money';
@@ -136,11 +137,12 @@ export function parseCreateWalletRequest(body: unknown): { playerId: string; ini
   });
 }
 
-const CORRELATION_ID = /^[\x21-\x7E]{1,128}$/;
-
-/** Reaproveita o X-Correlation-Id do cliente quando é bem formado; senão, usa o gerado. */
+/**
+ * O correlationId da requisição: o que o middleware já resolveu (header bem formado ou gerado), para o log, o evento
+ * da outbox e o header de resposta serem o mesmo. Fora de uma requisição (chamada direta), cai no header ou no gerado.
+ */
 export function correlationIdFrom(header: unknown, generate: () => string): string {
-  return typeof header === 'string' && CORRELATION_ID.test(header) ? header : generate();
+  return currentContext()?.correlationId ?? (isValidCorrelationId(header) ? header : generate());
 }
 
 /** Parâmetro de rota que precisa ser UUID (walletId, transactionId). */

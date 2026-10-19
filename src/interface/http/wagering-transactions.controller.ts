@@ -1,3 +1,4 @@
+import { enrichContext } from '../../infrastructure/logging/request-context';
 import { Body, Controller, Get, Headers, Inject, Param, Post, Res, UseGuards } from '@nestjs/common';
 import { ID_GENERATOR, type IdGenerator } from '../../application/ports/id-generator';
 import { GetWagerTransaction } from '../../application/wagering/get-wager-transaction';
@@ -69,11 +70,13 @@ export class WageringTransactionsController {
   ): Promise<TransactionResponse> {
     const idempotencyKey = parseIdempotencyKey(idempotencyKeyHeader);
     const payload = parseWagerTransactionPayload(body);
+    enrichContext({ walletId: payload.walletId, providerId: payload.providerId });
     const result = await this.submitTransaction.execute({
       idempotencyKey,
       payload,
       correlationId: correlationIdFrom(correlationHeader, () => this.ids.next()),
     });
+    enrichContext({ transactionId: result.transaction.id });
     response.status(statusCodeFor(result.transaction.status));
     return toTransactionResponse(result);
   }
@@ -81,7 +84,9 @@ export class WageringTransactionsController {
   /** Consulta: sempre 200 com o estado atual no corpo (ARCHITECTURE 9.3). 404 TRANSACTION_NOT_FOUND se não existe. */
   @Get(':transactionId')
   async get(@Param('transactionId') transactionId: string): Promise<TransactionResponse> {
-    const transaction = await this.getTransaction.byId(parseUuidParam(transactionId, 'transactionId'));
+    const id = parseUuidParam(transactionId, 'transactionId');
+    enrichContext({ transactionId: id });
+    const transaction = await this.getTransaction.byId(id);
     return toTransactionResponse({ transaction, idempotentReplay: false });
   }
 }
@@ -97,10 +102,13 @@ export class ProviderTransactionsController {
     @Param('providerId') providerId: string,
     @Param('externalTransactionId') externalTransactionId: string,
   ): Promise<TransactionResponse> {
+    const provider = parseIdentifierParam(providerId, 'providerId');
+    enrichContext({ providerId: provider });
     const transaction = await this.getTransaction.byProviderAndExternalId(
-      parseIdentifierParam(providerId, 'providerId'),
+      provider,
       parseIdentifierParam(externalTransactionId, 'externalTransactionId'),
     );
+    enrichContext({ transactionId: transaction.id });
     return toTransactionResponse({ transaction, idempotentReplay: false });
   }
 }

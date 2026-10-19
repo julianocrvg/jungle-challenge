@@ -5,6 +5,8 @@ import { AppModule, type AppOptions } from './app.module';
 import { instanceIdFromEnv } from './config';
 import { JsonLogger } from './infrastructure/logging/json-logger';
 import { HttpErrorFilter } from './interface/http/http-error.filter';
+import { requestLoggingMiddleware } from './interface/http/request-logging.middleware';
+import { ID_GENERATOR, type IdGenerator } from './application/ports/id-generator';
 
 export interface CreateAppOptions extends AppOptions {
   logger?: LoggerService | LogLevel[] | false;
@@ -19,6 +21,12 @@ export async function createApp(options: CreateAppOptions = {}): Promise<INestAp
   const { logger, ...appOptions } = options;
   const instanceId = appOptions.instanceId ?? instanceIdFromEnv();
   const app = await NestFactory.create(AppModule.forRoot({ ...appOptions, instanceId }), { logger: logger ?? new JsonLogger() });
+  // Primeiro middleware: abre o contexto de log (correlationId) para tudo que vem depois (ARCHITECTURE 11.3).
+  if (app.getHttpAdapter().getType() !== 'express') {
+    throw new Error('requestLoggingMiddleware assumes the Express adapter (route template in request.route.path)');
+  }
+  const ids = app.get<IdGenerator>(ID_GENERATOR);
+  app.use(requestLoggingMiddleware(() => ids.next()));
   // Toda resposta diz qual instância a atendeu, inclusive as de erro (ARCHITECTURE 10.2).
   app.use((_request: unknown, response: HeaderResponse, next: () => void) => {
     response.setHeader('X-Instance-Id', instanceId);

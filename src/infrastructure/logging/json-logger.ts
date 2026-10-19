@@ -3,6 +3,14 @@ import { errorFields } from './describe-error';
 
 type Level = 'info' | 'warn' | 'error' | 'debug' | 'verbose' | 'fatal';
 
+const SEVERITY: Record<Level, number> = { verbose: 0, debug: 1, info: 2, warn: 3, error: 4, fatal: 5 };
+
+/** `LOG_LEVEL` (default `info`): debug e verbose só saem com `LOG_LEVEL=debug` (ou `verbose`). */
+export function logLevelFromEnv(env: Record<string, string | undefined> = process.env): Level {
+  const value = env.LOG_LEVEL?.toLowerCase();
+  return value !== undefined && value in SEVERITY ? (value as Level) : 'info';
+}
+
 /** Um contexto de logger é um nome curto (`WagerConsumer`); um stack ou um texto livre nunca casa. */
 const CONTEXT = /^[A-Za-z][\w.-]{0,63}$/;
 const RESERVED = new Set(['timestamp', 'level', 'context', 'message']);
@@ -13,7 +21,10 @@ const RESERVED = new Set(['timestamp', 'level', 'context', 'message']);
  * vira `context`. Um `Error` recebido como mensagem sai por `errorFields` (nome, SQLSTATE, constraint e frames).
  */
 export class JsonLogger implements LoggerService {
-  constructor(private readonly write: (line: string) => void = (line) => void process.stdout.write(`${line}\n`)) {}
+  constructor(
+    private readonly write: (line: string) => void = (line) => void process.stdout.write(`${line}\n`),
+    private readonly minLevel: Level = logLevelFromEnv(),
+  ) {}
 
   log(message: unknown, ...params: unknown[]): void { this.emit('info', message, params); }
   error(message: unknown, ...params: unknown[]): void { this.emit('error', message, params); }
@@ -23,6 +34,7 @@ export class JsonLogger implements LoggerService {
   fatal(message: unknown, ...params: unknown[]): void { this.emit('fatal', message, params); }
 
   private emit(level: Level, message: unknown, params: unknown[]): void {
+    if (SEVERITY[level] < SEVERITY[this.minLevel]) return;
     const last = params.at(-1);
     const context = typeof last === 'string' && CONTEXT.test(last) ? last : undefined;
     const { text, fields } = split(message);

@@ -8,6 +8,7 @@ import { sqlStateOf } from '../../infrastructure/persistence/database-errors';
 import { classifyFailure } from '../messaging/failure-classification';
 import { InvalidMessageError, parseWagerMessage } from '../messaging/wager-message';
 import { errorFields } from '../../infrastructure/logging/describe-error';
+import { enrichContext, runWithContext } from '../../infrastructure/logging/request-context';
 
 export interface WagerConsumerOptions {
   /** Se falso, o laço não sobe com a aplicação. */
@@ -179,7 +180,12 @@ export class WagerTransactionsConsumer {
     return messages.filter((message) => this.notStarted.delete(message));
   }
 
-  private async handle(message: ReceivedMessage): Promise<Next> {
+  /** Um contexto de log por mensagem; o `messageId` vira o `correlationId` assim que a mensagem é lida (ARCHITECTURE 11.3). */
+  private handle(message: ReceivedMessage): Promise<Next> {
+    return runWithContext({ correlationId: message.transportId }, () => this.handleInContext(message));
+  }
+
+  private async handleInContext(message: ReceivedMessage): Promise<Next> {
     const started = performance.now();
     let context: Record<string, string | number | undefined> = {
       instanceId: this.options.instanceId,
@@ -195,6 +201,7 @@ export class WagerTransactionsConsumer {
         walletId: parsed.payload.walletId,
         providerId: parsed.payload.providerId,
       };
+      enrichContext({ messageId: parsed.messageId, correlationId: parsed.messageId, walletId: parsed.payload.walletId, providerId: parsed.payload.providerId });
       const result = await this.submit.execute({
         idempotencyKey: parsed.idempotencyKey,
         payload: parsed.payload,
@@ -206,6 +213,7 @@ export class WagerTransactionsConsumer {
       if (result.duplicateDelivery) this.metrics.increment('sqs_consumer_duplicates_total', { level: 'inbox' });
       else if (result.idempotentReplay) this.metrics.increment('sqs_consumer_duplicates_total', { level: 'idempotency' });
       this.metrics.increment('sqs_consumer_messages_total', { outcome });
+      enrichContext({ transactionId: result.transaction.id });
       context = { ...context, transactionId: result.transaction.id, status: result.transaction.status, outcome };
       // O commit já aconteceu: só agora o ack.
       await this.ack(message, context);
