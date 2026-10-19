@@ -135,14 +135,14 @@ export async function spawnInstance(id: string, queues: InstanceQueues, timeoutM
 }
 
 /** Polling no /health/ready até 200. Falso se o filho morreu antes (porta ocupada, erro de boot). */
-async function waitReady(instance: Instance, timeoutMs: number): Promise<boolean> {
+export async function waitReady(instance: Instance, timeoutMs: number): Promise<boolean> {
   let exited = false;
   void instance.child.exited.then(() => { exited = true; });
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (exited) return false;
     try {
-      const response = await fetch(`${instance.baseUrl}/health/ready`, { signal: AbortSignal.timeout(3_000) });
+      const response = await fetch(`${instance.baseUrl}/health/ready`, { signal: AbortSignal.timeout(3_000), keepalive: false });
       if (response.status === 200) return true;
     } catch {
       // ainda não escuta

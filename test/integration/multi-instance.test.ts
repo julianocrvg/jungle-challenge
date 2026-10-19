@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import {
   DeleteMessageCommand,
   DeleteQueueCommand,
@@ -19,6 +19,7 @@ import {
   type InstanceQueues,
   killAllInstancesSync,
   spawnInstance,
+  waitReady,
 } from './support/instances';
 import { countById, createTempFifoQueue, pendingOutbox, SQS, waitFor } from './support/outbox';
 
@@ -104,6 +105,13 @@ beforeAll(async () => {
   queues = { ...pair, eventsUrl: await createTempFifoQueue(client, 'multi-events') };
   instances = await Promise.all([0, 1, 2].map(() => spawn()));
 }, 60_000);
+
+// Antes de cada cenário, todas as instâncias vivas respondem /health/ready: nenhum cenário começa com uma instância
+// ainda subindo ou já caída (um erro de rede no primeiro request seria ambíguo).
+beforeEach(async () => {
+  const ready = await Promise.all(instances.filter((i) => !i.killed).map((i) => waitReady(i, 15_000)));
+  expect(ready.every(Boolean)).toBe(true);
+}, 30_000);
 
 afterAll(async () => {
   await Promise.all(spawned.map((instance) => instance.kill()));
