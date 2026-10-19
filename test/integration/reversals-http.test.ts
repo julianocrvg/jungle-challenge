@@ -185,6 +185,29 @@ describe('reversal rejections: 422, persisted, no ledger entry, balance untouche
     expect(await eventsOf(r.id)).toEqual(['WagerTransactionRejected']);
   });
 
+  test('REFERENCE_MISMATCH: same player and provider, reference in another wallet (only walletId differs)', async () => {
+    const brlWallet = await createWalletViaApi(api, '100.00');
+    const created = await api.post<WalletBody>('/wallets', {
+      playerId: brlWallet.playerId, initialBalance: { amount: '100.00', currency: 'USD' },
+    });
+    expect(created.status).toBe(201);
+    const usdWallet = created.body;
+    const b = await bet(brlWallet, '10.00');
+
+    const r = await send(usdWallet, {
+      kind: 'REFUND',
+      money: { amount: '10.00', currency: 'USD' },
+      referenceExternalTransactionId: b.payload.externalTransactionId,
+    });
+    expect(r.result.status).toBe(422);
+    expect(r.result.body).toMatchObject({
+      status: 'REJECTED', failureCode: 'REFERENCE_MISMATCH', balance: { amount: '100.00', currency: 'USD' },
+    });
+    expect(await balanceOf(usdWallet.id)).toBe('100.00');
+    expect(await balanceOf(brlWallet.id)).toBe('90.00');
+    expect(await entriesOf(r.id)).toEqual([]);
+  });
+
   test('REFERENCE_MISMATCH: reference of another player and wallet', async () => {
     const owner = await createWalletViaApi(api, '100.00');
     const other = await createWalletViaApi(api, '100.00');
