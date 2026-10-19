@@ -11,7 +11,7 @@ export function databaseUrl(): string {
 export function createOrmConfig(clientUrl: string = databaseUrl(), options: { poolMax?: number } = {}) {
   return defineConfig({
     clientUrl,
-    // Sem entidades: os comandos usam SQL explícito (ARCHITECTURE 1.2), e as leituras entram na fatia 5.
+    // Sem entidades: os comandos usam SQL explícito (ARCHITECTURE 1.2), assim como as leituras (ARCHITECTURE 1.2).
     entities: [],
     discovery: { warnWhenNoEntities: false },
     extensions: [Migrator],
