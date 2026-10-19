@@ -254,3 +254,30 @@ describe('lock_timeout', () => {
     }
   }, CONCURRENCY_TIMEOUT_MS);
 });
+
+describe('idempotency is decided by the database, not by the wallet lock', () => {
+  // A mesma Idempotency-Key em duas wallets diferentes NÃO serializa pelo lock da wallet: só o
+  // ON CONFLICT (idempotency_key) separa vencedor e perdedor. Com um SELECT prévio no lugar dele, as duas
+  // passam pela checagem e a perdedora estoura a UNIQUE (23505, 500) em vez de um 409 limpo (prova de mutação em 5.2).
+  test('the same key on two different wallets at once: one 200, one 409, one debit', async () => {
+    const rounds = await Promise.all(Array.from({ length: 30 }, async (_, round) => {
+      const [first, second] = await Promise.all([createWalletViaApi(api, '100.00'), createWalletViaApi(api, '100.00')]);
+      return { round, first, second, key: `shared-key-${round}-${Bun.randomUUIDv7()}` };
+    }));
+
+    const results = await Promise.all(rounds.flatMap(({ first, second, key }) => [
+      submit(api, wagerPayload(first, { money: brl('10.00') }), key),
+      submit(api, wagerPayload(second, { money: brl('10.00') }), key),
+    ]));
+
+    expect(statusesOf(results).filter((s) => s >= 500)).toEqual([]);
+    for (let i = 0; i < rounds.length; i++) {
+      const pair = results.slice(2 * i, 2 * i + 2);
+      expect(statusesOf(pair).sort()).toEqual([200, 409]);
+      expect(pair.find((r) => r.status === 409)?.body).toMatchObject({ code: 'IDEMPOTENCY_KEY_CONFLICT' });
+      const balances = await Promise.all([walletState(rounds[i]!.first.id), walletState(rounds[i]!.second.id)]);
+      expect(balances.map((b) => b.balance).sort()).toEqual(['100.00', '90.00']); // um único débito por key
+    }
+    expect(await walletsDivergingFromLedger(sql)).toEqual([]);
+  }, CONCURRENCY_TIMEOUT_MS);
+});
