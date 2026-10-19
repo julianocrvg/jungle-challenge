@@ -754,7 +754,7 @@ Caminhos relativos a `test/`. "Lacuna" marca o que não está coberto como pedid
 **Unidade**
 | Item exigido | Teste |
 |---|---|
-| Operações e validações de `Money` (escala, arredondamento, entradas inválidas) | `unit/domain/money.test.ts`: escala fixa de 2 casas, 15 formatos inválidos, aritmética exata, comparação. **Interpretação:** não há arredondamento, porque não há operação que gere mais de 2 casas (só soma e subtração) e uma entrada com 3 casas é recusada, não arredondada |
+| Operações e validações de `Money` (escala, arredondamento, entradas inválidas) | `unit/domain/money.test.ts`: escala fixa de 2 casas, 15 formatos inválidos, aritmética exata, comparação. O teste que recusa 3 casas é `unit/domain/money.test.ts` > `Money.from` > "rejects three decimals" (`test.each`, entrada `'25.001'`); pela API, o `unit/interface/wager-message.test.ts` e o `integration/sqs-consumer.test.ts` "a JSON-number amount and a 3-decimal amount go to the DLQ as INVALID_PAYLOAD". **Interpretação:** não há arredondamento, porque não há operação que gere mais de 2 casas (só soma e subtração) e uma entrada com 3 casas é recusada, não arredondada |
 | Invariantes da `Wallet` | `unit/domain/wallet.test.ts` (versão, débito acima do saldo, valor zero ou negativo, moeda, saldo igual à soma dos lançamentos) |
 | Regras de BET, WIN, LOSS, REFUND, ROLLBACK | `unit/domain/wager-transaction.test.ts` (criação por tipo, direção do ledger, `validateReference`, código de overdraw) |
 | Conflito de moeda | `unit/domain/money.test.ts` "Money currency conflicts"; `unit/domain/wallet.test.ts` "rejects an operation in another currency..."; integração: `CURRENCY_MISMATCH` em `integration/wager-submission-http.test.ts` |
