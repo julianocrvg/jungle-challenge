@@ -66,8 +66,8 @@ Decisões em ARCHITECTURE.md, seção 10.
 
 ## Fatia 9 (observações herdadas das fatias 6 a 8)
 - [ ] Logs JSON de verdade: hoje o Nest imprime texto com o JSON embutido; a varredura de `multi-instance.test.ts` procura padrões no texto
-- [ ] Auditar todos os pontos de log (filtro de exceções HTTP, publisher da outbox, worker de pendentes): nunca registrar `error.message` nem `stack` com texto livre. Só nome do erro, SQLSTATE, nome da constraint e frames do stack (o mesmo critério do consumidor SQS, commit 33a7b9d)
-- [ ] Estender o `afterEach` de "nenhum valor monetário em log" aos testes de HTTP, do publisher e do worker de pendentes
+- [x] Auditoria dos pontos de log (ARCHITECTURE 11.2), feita no commit 2a. Pontos auditados: filtro de exceções HTTP (`HttpErrorFilter`: deixou de logar `message` e `stack`; 503 com mensagem fixa), publisher da outbox (`OutboxPublisherWorker`, `PublishOutboxBatch`: nome validado), worker de pendentes (4 pontos), consumidor SQS (6 pontos; `failureDetail` da DLQ agora é um motivo fechado), `/health/ready` (nome do erro), reconciliação (só ids e diferença). Todos via `errorFields`
+- [x] `afterEach` de "nenhum valor monetário em log" estendido aos testes de HTTP, do publisher e do worker
 - [ ] `PublishOutboxBatch`: os contadores (`outbox_published_total` e retries) são incrementados antes do commit do lote; se o commit falhar, a métrica conta envios que serão refeitos. Mover para depois do commit
 - [ ] Índice parcial `(occurred_at) WHERE published_at IS NULL` para o `min(occurred_at)` da métrica de outbox lag, que hoje percorre todas as pendentes
 - [ ] ARCHITECTURE: retenção das linhas publicadas da outbox e da inbox (limpeza periódica); relógio (o `Clock` de cada instância grava `next_attempt_at`, e uma instância com relógio adiantado antecipa retries); evento envenenado (erro do remetente fica em retry para sempre, só com alerta)

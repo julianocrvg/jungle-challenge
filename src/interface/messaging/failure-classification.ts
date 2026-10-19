@@ -1,5 +1,5 @@
-import { ApplicationError, TransientInfrastructureError } from '../../application/errors';
-import { InvalidMessageError } from './wager-message';
+import { type ApplicationErrorCode, ApplicationError, TransientInfrastructureError } from '../../application/errors';
+import { InvalidMessageError, type InvalidMessageReason } from './wager-message';
 
 /*
  * Classificação das falhas do consumidor (ARCHITECTURE 7.3). Erro de negócio não chega aqui: uma REJECTED é
@@ -9,9 +9,12 @@ import { InvalidMessageError } from './wager-message';
  * - erro inesperado (bug): transitório com backoff curto, para nunca descartar uma mensagem válida por engano.
  */
 
+/** Conjunto fechado: o motivo vai para a DLQ (`failureReason` e `failureDetail`) e nunca deriva de texto de erro. */
+export type FailureReason = InvalidMessageReason | ApplicationErrorCode | 'UNEXPECTED_ERROR';
+
 export type FailureDisposition =
-  | { kind: 'permanent'; reason: string }
-  | { kind: 'transient'; reason: string; unexpected: boolean };
+  | { kind: 'permanent'; reason: FailureReason }
+  | { kind: 'transient'; reason: FailureReason; unexpected: boolean };
 
 export function classifyFailure(error: unknown): FailureDisposition {
   if (error instanceof InvalidMessageError) return { kind: 'permanent', reason: error.reason };

@@ -1,3 +1,5 @@
+import { describeError } from '../../infrastructure/logging/describe-error';
+
 /** Uma dependência sem a qual a instância não deve receber tráfego (ARCHITECTURE 10.1). */
 export interface ReadinessProbe {
   readonly name: string;
@@ -37,7 +39,7 @@ export async function checkReadiness(probes: readonly ReadinessProbe[], timeoutM
       await Promise.race([probe.check(controller.signal), timeout]);
       return { name: probe.name, failure: undefined };
     } catch (error) {
-      return { name: probe.name, failure: error instanceof Error ? error.name : 'UnknownError' };
+      return { name: probe.name, failure: describeError(error).errorName };
     } finally {
       clearTimeout(timer);
     }

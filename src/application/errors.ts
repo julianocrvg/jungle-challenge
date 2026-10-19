@@ -2,8 +2,14 @@
  * Erros que os use cases devolvem a quem chama (HTTP ou fila). Cada um tem um `code` estável e legível
  * por máquina; o mapeamento para status HTTP fica na camada de interface.
  */
+/** Conjunto fechado: o `code` vai para respostas, métricas e para o motivo da DLQ, então nunca é texto livre. */
+export type ApplicationErrorCode =
+  | 'INVALID_PAYLOAD' | 'WALLET_NOT_FOUND' | 'WALLET_ALREADY_EXISTS' | 'IDEMPOTENCY_KEY_CONFLICT'
+  | 'EXTERNAL_TRANSACTION_ID_CONFLICT' | 'INBOX_MESSAGE_CONFLICT' | 'SERVICE_UNAVAILABLE' | 'TRANSACTION_NOT_FOUND'
+  | 'INVALID_CURSOR' | 'INVALID_LIMIT';
+
 export abstract class ApplicationError extends Error {
-  abstract readonly code: string;
+  abstract readonly code: ApplicationErrorCode;
 
   constructor(message: string, options?: { cause?: unknown }) {
     super(message, options);

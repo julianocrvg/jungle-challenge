@@ -1,4 +1,4 @@
-import { type ArgumentsHost, Catch, type ExceptionFilter, HttpException, Logger } from '@nestjs/common';
+import { type ArgumentsHost, Catch, type ExceptionFilter, HttpException } from '@nestjs/common';
 import {
   ExternalTransactionIdConflictError,
   IdempotencyKeyConflictError,
@@ -10,7 +10,8 @@ import {
   WalletAlreadyExistsError,
   WalletNotFoundError,
 } from '../../application/errors';
-import { constraintOf, sqlStateOf } from '../../infrastructure/persistence/database-errors';
+import { errorFields } from '../../infrastructure/logging/describe-error';
+import { NestStructuredLogger } from '../../infrastructure/logging/nest-structured-logger';
 import { RequestValidationError } from './validation';
 
 export interface ErrorBody {
@@ -55,7 +56,8 @@ export function toHttpError(error: unknown): HttpError {
     return of(409, error);
   }
   if (error instanceof TransientInfrastructureError) {
-    return { ...of(503, error), retryAfterSeconds: RETRY_AFTER_SECONDS };
+    // Mensagem fixa: a do erro pode carregar texto do driver.
+    return { ...of(503, { code: error.code, message: 'Service temporarily unavailable' }), retryAfterSeconds: RETRY_AFTER_SECONDS };
   }
   if (error instanceof HttpException && error.getStatus() < 500) {
     // Erros do próprio Nest/Express: JSON malformado, rota inexistente, corpo grande demais.
@@ -73,7 +75,7 @@ interface MinimalResponse {
 
 @Catch()
 export class HttpErrorFilter implements ExceptionFilter {
-  private readonly logger = new Logger('HttpErrorFilter');
+  private readonly logger = new NestStructuredLogger('HttpErrorFilter');
 
   catch(error: unknown, host: ArgumentsHost): void {
     const response = host.switchToHttp().getResponse<MinimalResponse>();
@@ -85,19 +87,12 @@ export class HttpErrorFilter implements ExceptionFilter {
     response.status(httpError.status).json(httpError.body);
   }
 
-  // Sem payload nem valores financeiros: só o tipo do erro, a mensagem e a constraint/SQLSTATE.
+  // Só erros 5xx, e só o que o `errorFields` deixa passar: nome, SQLSTATE, constraint e frames. A mensagem e o stack
+  // são texto livre (o Postgres cita o valor recusado) e ficam fora, assim como corpo, headers e chaves de idempotência.
   private log(error: unknown, httpError: HttpError): void {
     if (httpError.status < 500) return;
-    const e = error instanceof Error ? error : new Error(String(error));
-    const cause = (e as { cause?: unknown }).cause ?? e;
-    const context = JSON.stringify({
-      code: httpError.body.code,
-      error: e.name,
-      message: e.message,
-      sqlState: sqlStateOf(cause) ?? null,
-      constraint: constraintOf(cause) ?? null,
-    });
-    if (httpError.status === 503) this.logger.warn(context);
-    else this.logger.error(context, e.stack);
+    const fields = { ...errorFields(error), responseCode: httpError.body.code, status: httpError.status };
+    if (httpError.status === 503) this.logger.warn('Request failed with a transient error', fields);
+    else this.logger.error('Request failed with an unexpected error', fields);
   }
 }

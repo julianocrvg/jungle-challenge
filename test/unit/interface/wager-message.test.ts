@@ -9,7 +9,7 @@ import {
 } from '../../../src/application/errors';
 import { hashInboxMessage, hashWagerPayload } from '../../../src/application/wagering/submit-wager-transaction';
 import { parseWagerTransactionPayload } from '../../../src/interface/http/validation';
-import { classifyFailure } from '../../../src/interface/messaging/failure-classification';
+import { classifyFailure, type FailureReason } from '../../../src/interface/messaging/failure-classification';
 import { InvalidMessageError, parseWagerMessage } from '../../../src/interface/messaging/wager-message';
 
 // O exemplo da seção 10 do enunciado.
@@ -88,7 +88,7 @@ describe('parseWagerMessage', () => {
 });
 
 describe('classifyFailure', () => {
-  test.each([
+  test.each<[Error, FailureReason]>([
     [new InvalidMessageError('INVALID_JSON', []), 'INVALID_JSON'],
     [new WalletNotFoundError('x'), 'WALLET_NOT_FOUND'],
     [new IdempotencyKeyConflictError('x'), 'IDEMPOTENCY_KEY_CONFLICT'],
@@ -106,5 +106,23 @@ describe('classifyFailure', () => {
 
   test('an unknown error is transient and flagged as unexpected', () => {
     expect(classifyFailure(new TypeError('bug'))).toEqual({ kind: 'transient', reason: 'UNEXPECTED_ERROR', unexpected: true });
+  });
+});
+
+describe('classifyFailure: o motivo da DLQ nunca deriva de texto de erro', () => {
+  test('mensagem com valor monetário não aparece no motivo, seja qual for a classe do erro', () => {
+    const leaky = 'balance 123.45 for wallet';
+    const errors = [
+      new Error(leaky),
+      new WalletNotFoundError(leaky),
+      new InvalidCommandError(leaky),
+      new InvalidMessageError('INVALID_PAYLOAD', [leaky]),
+      new TransientInfrastructureError(leaky),
+      leaky,
+      { message: leaky },
+    ];
+    for (const error of errors) {
+      expect(JSON.stringify(classifyFailure(error))).not.toContain('123.45');
+    }
   });
 });

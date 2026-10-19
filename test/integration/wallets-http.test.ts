@@ -1,6 +1,8 @@
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { createTestOrm, type Sql, sqlRunner, walletsDivergingFromLedger } from './support/database';
 import { createWalletViaApi, startTestApp, type TestApp, type WalletBody } from './support/app';
+
+import { monetaryLeaks } from './support/logs';
 
 let api: TestApp;
 let sql: Sql;
@@ -16,6 +18,13 @@ beforeAll(async () => {
 afterAll(async () => {
   await api?.close();
   await closeOrm?.();
+});
+
+beforeEach(() => api.logger.clear());
+
+// Nenhum log do HTTP traz valor monetário (ARCHITECTURE 11.2).
+afterEach(() => {
+  expect(monetaryLeaks(api.logger.entries)).toEqual([]);
 });
 
 describe('POST /wallets', () => {

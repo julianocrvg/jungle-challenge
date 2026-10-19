@@ -101,9 +101,11 @@ export class PublishOutboxBatch {
     } catch (error) {
       const reason = error instanceof PublishTimeoutError ? 'timeout' : 'call_error';
       this.metrics.increment('outbox_publish_call_failures_total', { reason });
+      // A camada de aplicação não importa a infraestrutura (errorFields): só o nome, e só com formato de identificador.
+      const errorName = error instanceof Error && /^[A-Za-z][\w$]{0,63}$/.test(error.name) ? error.name : 'unknown';
       this.logger.warn('Outbox batch publish failed; scheduling retry', {
         reason,
-        errorName: error instanceof Error ? error.name : 'unknown',
+        errorName,
         batchSize: messages.length,
       });
       return { published: [], failed: [] };

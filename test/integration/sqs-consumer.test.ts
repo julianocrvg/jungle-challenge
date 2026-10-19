@@ -241,7 +241,7 @@ describe('SQS consumer', () => {
       const errors = logger.entries.filter((e) => e.level === 'error');
       expect(errors.length).toBeGreaterThan(0);
       // Os frames do stack ficam (diagnóstico); a mensagem do erro, não. O afterEach confere os valores.
-      expect(errors.every((e) => String(e.fields.stack).includes(' at ') && !String(e.fields.stack).includes('bug while'))).toBe(true);
+      expect(errors.every((e) => /^at \S/m.test(String(e.fields.stack)) && !String(e.fields.stack).includes('bug while'))).toBe(true);
     }
   }, 40_000);
 

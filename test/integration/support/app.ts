@@ -36,7 +36,7 @@ export class CapturingLogger implements LoggerService {
   clear(): void { this.entries.length = 0; }
 
   private push(level: LogEntry['level'], message: unknown): void {
-    this.entries.push({ level, message: String(message) });
+    this.entries.push({ level, message: typeof message === 'string' ? message : JSON.stringify(message) });
   }
 }
 

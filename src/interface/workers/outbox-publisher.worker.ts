@@ -1,6 +1,7 @@
 import type { PublishOutboxBatch } from '../../application/outbox/publish-outbox-batch';
 import type { Metrics } from '../../application/ports/metrics';
 import type { StructuredLogger } from '../../application/ports/structured-logger';
+import { errorFields } from '../../infrastructure/logging/describe-error';
 
 export interface OutboxPublisherWorkerOptions {
   /** Se falso, o laço não sobe com a aplicação (instâncias só de API, ou testes que chamam o lote direto). */
@@ -62,7 +63,7 @@ export class OutboxPublisherWorker {
       } catch (error) {
         // Banco fora do ar ou bug: o lote foi desfeito e as linhas seguem pendentes. Espera e tenta de novo.
         this.metrics.increment('outbox_tick_errors_total');
-        this.logger.error('Outbox publisher tick failed', { errorName: error instanceof Error ? error.name : 'unknown' });
+        this.logger.error('Outbox publisher tick failed', errorFields(error));
       }
       if (!fullBatch && !this.stopping) await this.idle();
     }

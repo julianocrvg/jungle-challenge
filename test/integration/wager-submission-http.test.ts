@@ -1,5 +1,6 @@
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { createTestOrm, type Sql, sqlRunner, walletsDivergingFromLedger } from './support/database';
+import { monetaryLeaks } from './support/logs';
 import {
   createWalletViaApi,
   startTestApp,
@@ -27,6 +28,11 @@ afterAll(async () => {
 
 // Cada teste só enxerga os próprios logs.
 beforeEach(() => api.logger.clear());
+
+// Nenhum log do HTTP (filtro de erros, middleware, Nest) traz valor monetário (ARCHITECTURE 11.2).
+afterEach(() => {
+  expect(monetaryLeaks(api.logger.entries)).toEqual([]);
+});
 
 const brl = (amount: string) => ({ amount, currency: 'BRL' });
 
@@ -331,5 +337,17 @@ describe('WIN and LOSS with a reference: informative only (ARCHITECTURE 5.10)', 
 describe('invariant', () => {
   test('every wallet balance equals the balance rebuilt from the ledger', async () => {
     expect(await walletsDivergingFromLedger(sql)).toEqual([]);
+  });
+});
+
+describe('logs e payload malformado', () => {
+  test('JSON inválido com um amount vira 400 pelo filtro global e nada do corpo nem da chave chega aos logs', async () => {
+    const result = await api.post('/wagering/transactions', '{"amount":"123.45", "kind": "BET"', { 'idempotency-key': 'idem-malformed-key' });
+    expect(result.status).toBe(400);
+    // O corpo é o do nosso filtro (@Catch() global), não o padrão do Nest ({statusCode, message}).
+    expect(result.body).toMatchObject({ code: 'INVALID_PAYLOAD' });
+    const logged = JSON.stringify(api.logger.entries);
+    expect(logged).not.toContain('123.45');
+    expect(logged).not.toContain('idem-malformed-key');
   });
 });

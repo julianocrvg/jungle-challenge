@@ -4,7 +4,7 @@ import type { StructuredLogger } from '../../application/ports/structured-logger
 import type { PendingReferenceQueries } from '../../application/wagering/pending-reference-queries';
 import type { ResolvePendingReference } from '../../application/wagering/resolve-pending-reference';
 import { sqlStateOf } from '../../infrastructure/persistence/database-errors';
-import { errorName, stackFrames } from './error-log-fields';
+import { errorFields } from '../../infrastructure/logging/describe-error';
 
 export interface PendingReferenceWorkerOptions {
   /** Se falso, o laço não sobe com a aplicação (os testes chamam `runOnce` direto). */
@@ -94,7 +94,7 @@ export class PendingReferenceWorker {
       } catch (error) {
         // A listagem falhou (banco fora do ar): nada foi alterado. Espera e tenta de novo.
         this.metrics.increment('pending_reference_cycle_errors_total');
-        this.logger.error('Pending reference cycle failed', { errorName: errorName(error), sqlState: sqlStateOf(error) });
+        this.logger.error('Pending reference cycle failed', errorFields(error));
       }
       if (!again && !this.stopping) await this.idle();
     }
@@ -135,12 +135,12 @@ export class PendingReferenceWorker {
       if (error instanceof TransientInfrastructureError) {
         this.metrics.increment('pending_reference_errors_total', { reason: sqlState ?? 'transient' });
         this.logger.warn('Pending reference resolve failed; retried next cycle', {
-          transactionId, errorName: errorName(error), sqlState,
+          transactionId, ...errorFields(error),
         });
       } else {
         this.metrics.increment('pending_reference_errors_total', { reason: sqlState ?? 'unexpected' });
         this.logger.error('Unexpected error resolving pending reference', {
-          transactionId, errorName: errorName(error), sqlState, stack: stackFrames(error),
+          transactionId, ...errorFields(error),
         });
       }
       return false;
@@ -156,7 +156,7 @@ export class PendingReferenceWorker {
       this.metrics.gauge('pending_reference_oldest_age_seconds', backlog.oldestAgeSeconds);
     } catch (error) {
       // Só a métrica fica desatualizada; o ciclo em si já terminou.
-      this.logger.warn('Pending reference backlog metric failed', { errorName: errorName(error) });
+      this.logger.warn('Pending reference backlog metric failed', { ...errorFields(error) });
     }
   }
 

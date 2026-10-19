@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import type { SQSClient } from '@aws-sdk/client-sqs';
 import { MikroORM } from '@mikro-orm/postgresql';
 import type { EventPublisher, PublishResult } from '../../src/application/ports/event-publisher';
@@ -7,7 +7,8 @@ import type { OutboxMessage } from '../../src/domain/outbox-message';
 import { createSqsClient } from '../../src/infrastructure/messaging/sqs-event-publisher';
 import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { parseTimestamp } from '../../src/infrastructure/persistence/timestamps';
-import { createWalletViaApi, startTestApp, submit, type TestApp, wagerPayload } from './support/app';
+import { CapturingLogger, createWalletViaApi, startTestApp, submit, type TestApp, wagerPayload } from './support/app';
+import { monetaryLeaks } from './support/logs';
 import { createTestOrm, type Sql, sqlRunner, TEST_DATABASE_URL, walletsDivergingFromLedger } from './support/database';
 import {
   countById,
@@ -37,15 +38,23 @@ let sqs: SQSClient;
 const queues: string[] = [];
 const extraOrms: MikroORM[] = [];
 
+/** Um logger compartilhado: o do Nest é estático, e o publisher de cada app loga no último criado. */
+const logs = new CapturingLogger();
+const startApp = (options: Parameters<typeof startTestApp>[0] = {}): Promise<TestApp> => startTestApp({ logger: logs, ...options });
+
+beforeEach(() => logs.clear());
+
 beforeAll(async () => {
   orm = await createTestOrm();
   sql = sqlRunner(orm);
-  api = await startTestApp(); // publisher desligado: os eventos ficam pendentes até o teste publicar
+  api = await startApp(); // publisher desligado: os eventos ficam pendentes até o teste publicar
   sqs = createSqsClient(SQS);
 });
 
 afterEach(async () => {
   while (extraOrms.length > 0) await extraOrms.pop()?.close(true);
+  // Nenhum log do publisher nem do HTTP traz valor monetário (ARCHITECTURE 11.2).
+  expect(monetaryLeaks(logs.entries)).toEqual([]);
 });
 
 afterAll(async () => {
@@ -103,7 +112,7 @@ function closedPort(): number {
 describe('outbox INSERT', () => {
   test('next_attempt_at comes from the application Clock, never from the column default', async () => {
     const fixed = new Date('2020-01-01T00:00:00.000Z');
-    const clockApp = await startTestApp({ clock: new ManualClock(fixed) });
+    const clockApp = await startApp({ clock: new ManualClock(fixed) });
     let created: Set<string>;
     try {
       created = await seedEvents(clockApp, 1, 0);
@@ -157,6 +166,9 @@ describe('PublishOutboxBatch against LocalStack', () => {
 
     expect(await unavailable.batch.execute()).toEqual({ claimed: 3, published: 0, retried: 3 });
     expect(unavailable.metrics.counter('outbox_publish_call_failures_total', { reason: 'call_error' })).toBe(1);
+    // O log do lote chegou ao logger capturado, só com o nome do erro de rede (nunca a mensagem) e sem valores.
+    expect(unavailable.logger.entries.some((e) => e.message.includes('publish failed'))).toBe(true);
+    expect(monetaryLeaks(unavailable.logger.entries)).toEqual([]);
     const pending = await pendingOutbox(sql);
     expect(pending.length).toBe(3);
     for (const row of pending) {
@@ -240,7 +252,7 @@ describe('worker lifecycle', () => {
   test('recovery after restart: events committed while no publisher ran (or left in retry) are published by the next instance', async () => {
     const queueUrl = await newQueue();
     // Instância 1: grava e "morre" sem publicar; antes disso, um lote falhou com o SQS fora do ar.
-    const first = await startTestApp();
+    const first = await startApp();
     let created: Set<string>;
     try {
       created = await seedEvents(first, 2, 2);
@@ -253,7 +265,7 @@ describe('worker lifecycle', () => {
     expect((await pendingOutbox(sql)).length).toBe(created.size);
 
     // Instância 2: sobe com o publisher ligado e drena tudo, inclusive os que estavam em backoff.
-    const second = await startTestApp({ outbox: { enabled: true, pollIntervalMs: 50 }, sqs: { eventsQueueUrl: queueUrl } });
+    const second = await startApp({ outbox: { enabled: true, pollIntervalMs: 50 }, sqs: { eventsQueueUrl: queueUrl } });
     try {
       await waitFor(() => pendingOutbox(sql), (rows) => rows.length === 0);
     } finally {
@@ -265,7 +277,7 @@ describe('worker lifecycle', () => {
   test('shutdown via app.close(): the in-flight batch is committed and no new batch starts (SIGTERM path, ARCHITECTURE 6.5)', async () => {
     const queueUrl = await newQueue();
     const gated = new GatedPublisher(sqsPublisher(queueUrl));
-    const app = await startTestApp({ outbox: { enabled: true, pollIntervalMs: 50 }, eventPublisher: gated });
+    const app = await startApp({ outbox: { enabled: true, pollIntervalMs: 50 }, eventPublisher: gated });
     let created: Set<string>;
     let closed = false;
     let closing: Promise<void> | undefined;

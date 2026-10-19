@@ -7,7 +7,7 @@ import { type BackoffPolicy, backoffDelayMs } from '../../domain/backoff';
 import { sqlStateOf } from '../../infrastructure/persistence/database-errors';
 import { classifyFailure } from '../messaging/failure-classification';
 import { InvalidMessageError, parseWagerMessage } from '../messaging/wager-message';
-import { errorName, stackFrames } from './error-log-fields';
+import { errorFields } from '../../infrastructure/logging/describe-error';
 
 export interface WagerConsumerOptions {
   /** Se falso, o laço não sobe com a aplicação. */
@@ -127,7 +127,7 @@ export class WagerTransactionsConsumer {
       } catch (error) {
         if (this.stopping) break; // o abort do shutdown cai aqui
         this.metrics.increment('sqs_consumer_receive_errors_total');
-        this.logger.warn('Wager queue receive failed', { errorName: errorName(error) });
+        this.logger.warn('Wager queue receive failed', { ...errorFields(error) });
         await this.idle(this.options.receiveErrorDelayMs);
         continue;
       } finally {
@@ -220,12 +220,12 @@ export class WagerTransactionsConsumer {
 
   private async handleFailure(message: ReceivedMessage, error: unknown, context: LogFields): Promise<Next> {
     const disposition = classifyFailure(error);
-    if (disposition.kind === 'permanent') return this.deadLetter(message, disposition.reason, detailOf(error), context);
+    if (disposition.kind === 'permanent') return this.deadLetter(message, disposition.reason, disposition.reason, context);
 
     if (disposition.unexpected) {
       // Bug: só os frames do stack. A mensagem do erro é texto livre (pode citar valores ou o SQL) e fica fora.
       this.logger.error('Unexpected error processing wager message', {
-        ...context, errorName: errorName(error), sqlState: sqlStateOf(error), stack: stackFrames(error),
+        ...context, ...errorFields(error),
       });
     }
     // Para falhas de banco, o SQLSTATE (55P03, 40P01...) é o motivo mais útil na métrica.
@@ -241,7 +241,7 @@ export class WagerTransactionsConsumer {
       await this.queue.changeVisibility(message, delaySeconds);
     } catch (changeError) {
       // Sem a mudança, a mensagem volta quando a visibilidade original acabar: só fica mais lenta.
-      this.logger.warn('ChangeMessageVisibility failed', { ...context, errorName: errorName(changeError) });
+      this.logger.warn('ChangeMessageVisibility failed', { ...context, ...errorFields(changeError) });
     }
     return 'hold-group';
   }
@@ -255,7 +255,7 @@ export class WagerTransactionsConsumer {
       await this.queue.sendToDeadLetter(message, { reason, detail });
     } catch (error) {
       this.metrics.increment('sqs_consumer_dlq_send_failures_total');
-      this.logger.error('Failed to move wager message to the DLQ', { ...context, reason, errorName: errorName(error) });
+      this.logger.error('Failed to move wager message to the DLQ', { ...context, reason, ...errorFields(error) });
       return 'hold-group';
     }
     this.metrics.increment('sqs_consumer_dlq_total', { reason });
@@ -271,7 +271,7 @@ export class WagerTransactionsConsumer {
       await this.queue.delete(message);
     } catch (error) {
       this.metrics.increment('sqs_consumer_ack_failures_total');
-      this.logger.warn('DeleteMessage failed; the message will be redelivered', { ...context, errorName: errorName(error) });
+      this.logger.warn('DeleteMessage failed; the message will be redelivered', { ...context, ...errorFields(error) });
     }
   }
 
@@ -282,7 +282,7 @@ export class WagerTransactionsConsumer {
         this.metrics.increment('sqs_consumer_released_total', { reason });
       } catch (error) {
         // Volta sozinha quando a visibilidade acabar.
-        this.logger.warn('Failed to release wager message', { sqsMessageId: message.transportId, errorName: errorName(error) });
+        this.logger.warn('Failed to release wager message', { sqsMessageId: message.transportId, ...errorFields(error) });
       }
     }));
   }
@@ -297,10 +297,4 @@ export class WagerTransactionsConsumer {
       };
     });
   }
-}
-
-/** Detalhe curto para o atributo da DLQ: as mensagens dos nossos erros não carregam o payload. */
-function detailOf(error: unknown): string {
-  if (error instanceof InvalidMessageError) return error.details.join('; ');
-  return error instanceof Error ? error.message : String(error);
 }
