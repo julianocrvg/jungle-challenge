@@ -9,6 +9,7 @@ import {
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { Money } from '../../src/domain/money';
 import { createSqsClient } from '../../src/infrastructure/messaging/sqs-event-publisher';
+import { scanLogLine } from '../helpers/scan-log-line';
 import { type WalletBody, wagerPayload } from './support/app';
 import { createTempQueuePair, envelope, queueDepth, receiveDeadLetters, sendMessages } from './support/consumer';
 import { createTestOrm, type Sql, sqlRunner, walletsDivergingFromLedger } from './support/database';
@@ -99,6 +100,7 @@ beforeAll(async () => {
   // A varredura de logs reconhece o que procura (sem isso, um regex quebrado passaria sempre).
   expect(FORBIDDEN_LOG_PATTERNS.some((p) => p.test('new row violates check constraint "wallets_balance_non_negative"'))).toBe(true);
   expect(FORBIDDEN_LOG_PATTERNS.some((p) => p.test('error: deadlock detected'))).toBe(true);
+  expect(scanLogLine(JSON.stringify({ level: 'error', message: 'x', constraint: 'wallets_balance_non_negative' }), FORBIDDEN_LOG_PATTERNS)).toBe(true);
 
   client = createSqsClient(SQS);
   const pair = await createTempQueuePair(client, 'multi', CHILD_REDRIVE_MAX_RECEIVE);
@@ -371,7 +373,7 @@ function forbiddenLogLines(): string[] {
     const stdout = instance.killed ? instance.stdout.lines.slice(0, -1) : instance.stdout.lines;
     const stderr = instance.killed ? instance.stderr.lines.slice(0, -1) : instance.stderr.lines;
     return [...stdout, ...stderr]
-      .filter((line) => FORBIDDEN_LOG_PATTERNS.some((pattern) => pattern.test(line)))
+      .filter((line) => scanLogLine(line, FORBIDDEN_LOG_PATTERNS))
       .map((line) => `${instance.id}: ${line}`);
   });
 }
