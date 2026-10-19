@@ -9,7 +9,7 @@ import {
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { Money } from '../../src/domain/money';
 import { createSqsClient } from '../../src/infrastructure/messaging/sqs-event-publisher';
-import { scanLogLine } from '../helpers/scan-log-line';
+import { scanLogLine } from '../support/scan-log-line';
 import { type WalletBody, wagerPayload } from './support/app';
 import { createTempQueuePair, envelope, queueDepth, receiveDeadLetters, sendMessages } from './support/consumer';
 import { createTestOrm, type Sql, sqlRunner, walletsDivergingFromLedger } from './support/database';

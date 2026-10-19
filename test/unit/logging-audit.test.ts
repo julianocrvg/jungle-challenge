@@ -8,6 +8,11 @@ import { describe, expect, test } from 'bun:test';
  *   2. uma variável de `catch` (ou parâmetro de `.catch(...)`), direta ou dentro de template, `String()`,
  *      `JSON.stringify()` ou spread, fora de `errorFields()` / `describeError()`, as únicas funções que filtram erro.
  *
+ *
+ * Regra 3 (premissa do ARCHITECTURE 10.2): `errorFields` / `describeError` não podem ser argumento de
+ * `logger.info/.log/.debug`. O scan de logs do multi-instance só procura SQLSTATE e nome de constraint em linhas
+ * `warn`/`error`; um `errorFields` numa linha `info` colocaria esses valores onde ninguém olha.
+ *
  * Não é uma AST: o `typescript` 7 (port nativo) não expõe a API de compilador em JS, e não se adiciona dependência
  * só para isto. É um varredor de texto com comentários e strings mascarados e parênteses balanceados. Limites: o
  * escopo de uma variável de catch é o arquivo inteiro (pode acusar de mais, nunca de menos) e um erro repassado
@@ -15,6 +20,7 @@ import { describe, expect, test } from 'bun:test';
  */
 
 const LOGGER_CALL = /\b[\w.]*[Ll]ogger\.(?:info|warn|error|log|debug|verbose|fatal)\s*\(/g;
+const LOW_LEVEL_LOGGER_CALL = /\b[\w.]*[Ll]ogger\.(?:info|log|debug)\s*\(/g;
 const SAFE_CALL = /\b(?:errorFields|describeError)\s*\(/g;
 const CATCH_NAMES = [/\bcatch\s*\(\s*(\w+)/g, /\.catch\(\s*(?:async\s*)?\(?\s*(\w+)/g];
 
@@ -128,6 +134,47 @@ export function findLoggerLeaks(source: string): Leak[] {
   return leaks;
 }
 
+/** Chamadas de `errorFields`/`describeError` dentro dos argumentos de `logger.info/.log/.debug`. */
+export function findErrorFieldsInLowLevelLogs(source: string): Leak[] {
+  const code = mask(source);
+  const leaks: Leak[] = [];
+  for (const call of code.matchAll(LOW_LEVEL_LOGGER_CALL)) {
+    const open = call.index! + call[0].length - 1;
+    const args = code.slice(open + 1, closing(code, open));
+    for (const match of args.matchAll(SAFE_CALL)) {
+      const index = open + 1 + match.index!;
+      leaks.push({
+        line: source.slice(0, index).split('\n').length,
+        reason: `${match[0].slice(0, -1).trim()} em logger.${/\.(info|log|debug)\s*\($/.exec(call[0])![1]}`,
+      });
+    }
+  }
+  return leaks;
+}
+
+describe('o detector de errorFields em níveis baixos reconhece o que procura', () => {
+  test.each([
+    ['errorFields em info', 'this.logger.info("x", errorFields(error));'],
+    ['spread em info', 'this.logger.info("x", { id, ...errorFields(error) });'],
+    ['describeError em debug', 'this.logger.debug("x", describeError(error));'],
+    ['errorFields em log', 'logger.log("x", { ...errorFields(e) });'],
+    ['em várias linhas', 'this.logger.info(\n  "x",\n  {\n    ...errorFields(error),\n  },\n);'],
+  ])('detecta %s', (_name, source) => {
+    expect(findErrorFieldsInLowLevelLogs(source).length).toBeGreaterThan(0);
+  });
+
+  test.each([
+    ['errorFields em warn', 'this.logger.warn("x", errorFields(error));'],
+    ['errorFields em error', 'this.logger.error("x", { ...errorFields(error) });'],
+    ['info só com campos fixos', 'this.logger.info("x", { messageId });'],
+    ['texto em string', 'this.logger.info("errorFields(error) fica em warn", {});'],
+    ['texto em comentário', 'this.logger.info("x", {}); // errorFields(error)'],
+    ['info seguido de warn com errorFields', 'this.logger.info("x", {});\nthis.logger.warn("y", errorFields(e));'],
+  ])('aceita %s', (_name, source) => {
+    expect(findErrorFieldsInLowLevelLogs(source)).toEqual([]);
+  });
+});
+
 describe('o detector de vazamentos em logs reconhece o que procura', () => {
   const wrap = (body: string): string => `try {} catch (error) { ${body} }`;
 
@@ -175,6 +222,21 @@ describe('src/', () => {
     // Sem isso, um glob ou regex quebrado passaria em vazio.
     expect(scanned).toBeGreaterThan(30);
     expect(loggerCalls).toBeGreaterThan(20);
+    expect(found).toEqual([]);
+  });
+});
+
+describe('src/ (níveis baixos)', () => {
+  test('errorFields e describeError nunca são argumento de logger.info/.log/.debug', async () => {
+    const found: string[] = [];
+    let lowLevelCalls = 0;
+    for await (const path of new Bun.Glob('src/**/*.ts').scan('.')) {
+      const source = await Bun.file(path).text();
+      lowLevelCalls += [...mask(source).matchAll(LOW_LEVEL_LOGGER_CALL)].length;
+      for (const leak of findErrorFieldsInLowLevelLogs(source)) found.push(`${path}:${leak.line} ${leak.reason}`);
+    }
+    // Sem isso, um glob ou regex quebrado passaria em vazio.
+    expect(lowLevelCalls).toBeGreaterThan(5);
     expect(found).toEqual([]);
   });
 });

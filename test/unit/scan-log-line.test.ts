@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { MAX_SCAN_DEPTH, scanLogLine } from '../helpers/scan-log-line';
+import { MAX_SCAN_DEPTH, scanLogLine } from '../support/scan-log-line';
 
 const PATTERNS = [/40P01/, /deadlock detected/i, /\b(wallets_balance_non_negative)\b/];
 const line = (entry: unknown): string => JSON.stringify(entry);
