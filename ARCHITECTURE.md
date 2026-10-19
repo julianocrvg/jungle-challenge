@@ -2,6 +2,85 @@
 
 Decisões técnicas do serviço, agrupadas por componente. Cada entrada diz o que foi decidido, por quê e qual teste o prova. As seções são referenciadas pelo número no código e nos testes (`ARCHITECTURE 5.1`), por isso a numeração é estável.
 
+## Índice
+
+**Por tema** (os tópicos pedidos pelo enunciado):
+
+| Tema | Seções |
+|---|---|
+| Por que MikroORM e como o Money é mapeado | [1.2](#12-por-que-mikroorm-e-como-o-money-é-mapeado), 2.1, 4.1 |
+| Estratégia de concorrência e trade-offs | [0.2](#02-estratégia-de-concorrência-e-trade-offs), 5.1 (lock antes do INSERT), 5.2, 5.11 (ordem de locks), 2.5 (`wallet_version`) |
+| Algoritmo do `payloadHash` | 5.3, 7.1 (fila), 7.2 (hash da inbox) |
+| Máquina de estados da transação | [0.3](#03-máquina-de-estados-da-transação), 4.3 |
+| Taxonomia de `failureCode` | 3 |
+| Mapeamento HTTP | [12](#12-mapeamento-http-consolidado), 5.9, 9.3 |
+| Autenticação (`AuthGuard` no-op) | 11.1 |
+| Outbox, inbox e mensageria | 6 (publisher), 7 (consumidor, inbox, DLQ), 8 (pendentes) |
+| Observabilidade | 11.2 (logs), 11.3 (`correlationId`), 11.4 (métricas), 10.1 (health) |
+| Limitações conhecidas | [15](#15-limitações-conhecidas) |
+| Eliminatórias → proteção → teste | [13](#13-falhas-eliminatórias-onde-está-a-proteção-e-qual-teste-a-prova) |
+| Testes exigidos pelo enunciado | [14](#14-testes-exigidos-pelo-enunciado-seção-13-e-onde-estão) |
+
+**Por seção:** 0 Visão geral · 1 Setup · 2 Schema · 3 `failure_code` · 4 Domínio · 5 Submissão · 6 Publisher da outbox · 7 Consumidor SQS · 8 Worker de PENDING_REFERENCE · 9 Consultas e reconciliação · 10 Health e múltiplas instâncias · 11 Observabilidade e autenticação · 12 Mapeamento HTTP · 13 Eliminatórias · 14 Testes do enunciado · 15 Limitações.
+
+## 0. Visão geral
+
+### 0.1 Componentes e fluxo
+Uma única aplicação NestJS, rodando em N instâncias iguais, sem coordenação entre elas além do PostgreSQL. Cada instância tem:
+- **API HTTP** (seção 12): wallets, submissão de transações, consultas, ledger, reconciliação, health e métricas;
+- **consumidor** de `wager-transactions.fifo` (7), que chama o **mesmo use case** de submissão do HTTP;
+- **publisher da outbox** (6), que envia os eventos para `wager-events.fifo` depois do commit;
+- **worker de PENDING_REFERENCE** (8), que resolve reversões que chegaram antes da referência.
+
+```
+HTTP  ──┐                                           ┌──> publisher ──> wager-events.fifo
+        ├──> SubmitWagerTransaction ──> PostgreSQL ─┤
+SQS   ──┘   (uma transação SQL: inbox,              └──> worker de pendentes ──> ResolvePendingReference
+             lock, transação, ledger,
+             saldo, outbox)
+```
+
+Camadas: `src/domain` (TypeScript puro, sem framework, seção 4), `src/application` (use cases e portas), `src/infrastructure` (SQL, SQS, logs, métricas) e `src/interface` (controllers e workers). As invariantes de dinheiro, unicidade e imutabilidade estão no banco (2) e no domínio (4).
+
+### 0.2 Estratégia de concorrência e trade-offs
+**Escolha: lock pessimista por linha da wallet.** Toda mudança de saldo ou de estado de uma transação acontece numa transação SQL que começa com `SELECT ... FOR UPDATE` na linha da wallet (5.1). A unidade de concorrência é a `walletId`: wallets diferentes nunca se esperam, e não há lock global.
+
+- **Wallet travada antes de qualquer INSERT** (5.1): o INSERT da transação pegaria `FOR KEY SHARE` na wallet pela FK, e dois `FOR KEY SHARE` seguidos de dois `FOR UPDATE` formam um deadlock (`40P01`). Travando primeiro, a segunda requisição só espera na fila.
+- **Ordem de locks fixa: wallet primeiro, sempre** (5.11), na submissão, no resolve e no worker de pendentes. O worker lista candidatos sem lock (8.1) em vez de usar `SKIP LOCKED` na transação, o que inverteria a ordem.
+- **Decisão sob o lock, linha inserida no estado final** (5.2): as regras rodam em memória com a wallet travada, e o `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING` grava o resultado definitivo. A `UNIQUE` decide a idempotência; o lock só serializa.
+- **`version` como defesa extra:** `UPDATE wallets ... WHERE id = ? AND version = ?` confere 1 linha afetada; com o `FOR UPDATE` isso nunca falha, e se falhar é bug e a transação é desfeita.
+- **`wallet_version` no ledger** (2.5): cada lançamento grava a versão da wallet depois dele, com `UNIQUE (wallet_id, wallet_version)`. Um lost update apareceria como violação de unicidade no banco, mesmo com bug no código. A mesma coluna é o cursor estável da paginação (9.2).
+- **`lock_timeout`** (5.5): espera anormal vira `503` com `Retry-After` em vez de prender uma conexão.
+- **Leituras sem lock** (9.1): consultas e reconciliação não competem com a submissão; a reconciliação lê saldo e ledger numa só instrução (9.4).
+- **`SKIP LOCKED` só na outbox** (6.2), onde publishers concorrentes dividem linhas sem tocar em wallets.
+
+**Por que não lock otimista com retry.** Numa wallet disputada (o cenário de 2 apostas de 80 sobre 100, ou 50 apostas simultâneas), o otimista faria a maioria das tentativas falhar e repetir, com latência imprevisível e um limite de retries que, quando estoura, devolve erro para uma operação válida. O pessimista transforma a disputa em fila, com resultado determinístico. **Custo aceito:** o throughput de uma única wallet é limitado pela duração da transação, uma conexão do pool fica presa durante a espera (por isso o orçamento do pool, 8.5, e o `lock_timeout`), e um replay também espera o lock (5.1).
+
+### 0.3 Máquina de estados da transação
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: create (só em memória)
+    PENDING --> PROCESSED: regra aplicada (BET, WIN, LOSS, reversão resolvida)
+    PENDING --> REJECTED: regra de negócio (failureCode)
+    PENDING --> PENDING_REFERENCE: REFUND/ROLLBACK sem referência aplicada
+    PENDING --> FAILED: modelado, sem caminho hoje
+    PENDING_REFERENCE --> PROCESSED: worker resolve
+    PENDING_REFERENCE --> REJECTED: regra, ou prazo esgotado
+    PENDING_REFERENCE --> FAILED: modelado, sem caminho hoje
+    PROCESSED --> [*]
+    REJECTED --> [*]
+    FAILED --> [*]
+```
+
+- `PENDING` nunca é persistido: a linha nasce em `PROCESSED`, `REJECTED` ou `PENDING_REFERENCE` (4.3, 5.2). A OPENING, interna, é criada e processada na mesma transação da criação da wallet (5.6).
+- `PROCESSED`, `REJECTED` e `FAILED` são terminais: qualquer transição lança `InvalidTransactionStateError`; `rehydrate` não revalida.
+- `PENDING_REFERENCE → PENDING_REFERENCE` não é transição: o retry só conta `attempts` e reagenda (4.3, 8.2).
+- O prazo esgotado gera `REFERENCE_NOT_FOUND` (referência ausente) ou `REFERENCE_NOT_PROCESSED` (conhecida, não aplicada) (8.3).
+- `FAILED` / `INTERNAL_ERROR`: ver seção 3.
+- Só REFUND e ROLLBACK entram em `PENDING_REFERENCE`.
+
+O schema espelha a máquina: `wt_status_valid`, `wt_failure_code_status`, `wt_terminal_processed_at`, `wt_balance_after_terminal` e `wt_processed_reversal_resolved` (2.4).
+
 ## 1. Setup
 
 ### 1.1 Versões
@@ -503,7 +582,7 @@ As consultas de wallet e ledger passam pela porta `WalletQueries` (`SqlWalletQue
 
 ### 9.4 Reconciliação
 `POST /wallets/:walletId/reconciliation` devolve `{walletId, storedBalance, calculatedBalance, difference, consistent, checkedEntries}`. `calculatedBalance` é a soma dos créditos menos os débitos de `wallet_ledger_entries`, **incluindo OPENING**; `difference = storedBalance − calculatedBalance`. Os três valores são `{amount, currency}` (a `difference` pode ser negativa, como `"-7.50"`).
-- **Um único instante consistente, sem lock.** Saldo guardado e soma do ledger vêm de **uma só instrução SQL** (`wallets CROSS JOIN LATERAL (SELECT SUM ... FROM wallet_ledger_entries)`). No READ COMMITTED cada instrução enxerga um snapshot único, e a submissão grava wallet e lançamento na mesma transação, então o snapshot vê os dois ou nenhum. Duas leituras separadas (ou uma leitura entre o `UPDATE` da wallet e o commit do lançamento) poderiam apanhar saldo novo com ledger antigo e acusar divergência falsa. REPEATABLE READ também resolveria, mas custaria uma transação explícita sem ganho. A reconciliação **não trava a wallet**: não atrasa apostas nem é atrasada por elas.
+- **Um único instante consistente, sem lock.** Saldo guardado e soma do ledger vêm de **uma só instrução SQL** (`wallets CROSS JOIN LATERAL (SELECT SUM ... FROM wallet_ledger_entries)`). No READ COMMITTED cada instrução enxerga um snapshot único, e a submissão grava wallet e lançamento na mesma transação, então o snapshot vê os dois ou nenhum. Duas leituras separadas (ou uma leitura entre o `UPDATE` da wallet e o commit do lançamento) poderiam apanhar saldo novo com ledger antigo e acusar divergência falsa. REPEATABLE READ também resolveria, mas custaria uma transação explícita sem ganho. **Prova de mutação:** com saldo e soma em duas leituras separadas, o teste de reconciliação em paralelo com 90 apostas (9.5) acusou divergência falsa em 3 de 3 rodadas; o código de uma instrução passa. A reconciliação **não trava a wallet**: não atrasa apostas nem é atrasada por elas.
 - **Aritmética no Postgres.** Soma, diferença e a comparação `balance = calculated` são `NUMERIC`; o JavaScript só repassa strings. Nenhum `number` toca dinheiro.
 - **Sempre 200.** A divergência é o resultado da operação (`consistent: false`), não uma falha do pedido. Wallet inexistente: 404; id malformado: 400. É um `POST` porque é uma operação (percorre o ledger e tem efeitos de observabilidade), não um recurso.
 - **Divergência não é corrigida.** O ledger é imutável (2.5) e decidir qual lado está certo (saldo ou ledger) é uma decisão humana. O efeito é: log `error` com **apenas** `walletId`, `difference`, `checkedEntries` e `correlationId` (sem saldo guardado, saldo calculado nem payload), o contador `reconciliation_divergences_total` e `consistent: false`. A `difference` no log é o único valor monetário permitido ali, e o teste confere que os saldos não aparecem.
@@ -605,7 +684,7 @@ Testes: `request-logging.middleware.test.ts` (unidade: header válido e inválid
 | Métrica | Onde | Observação |
 |---|---|---|
 | `wager_transactions_total{status,kind}` | `SubmitWagerTransaction` e `ResolvePendingReference`, **depois do commit** | Conta a **transição** para PROCESSED, REJECTED ou PENDING_REFERENCE, inclusive as resolvidas pelo worker de pendentes. Replay e duplicata não contam. `wager_rejections_total{failure_code}` acompanha. |
-| `wager_duplicates_total{source=http\|sqs,level}` | `SubmitWagerTransaction` | Duplicata = replay com a mesma chave e o mesmo payload (inclui perder a corrida do `ON CONFLICT`) ou a mesma mensagem da fila reentregue. `level` separa `idempotency_key` de `inbox`. Substitui `sqs_consumer_duplicates_total`. |
+| `wager_duplicates_total{source=http\|sqs,level}` | `SubmitWagerTransaction` | Duplicata = replay com a mesma chave e o mesmo payload (inclui perder a corrida do `ON CONFLICT`) ou a mesma mensagem da fila reentregue. `level` separa `idempotency_key` de `inbox`. |
 | `wager_idempotency_conflicts_total{kind}` | `SubmitWagerTransaction` | O 409 (mesma chave com payload diferente, id externo ou messageId) **não** é duplicata; tem contador próprio. |
 | `db_lock_conflicts_total{sqlstate=55P03\|40P01}` | `MikroOrmUnitOfWork`, **único ponto** | `lock_timeout` e deadlock. Incrementa quando o UoW vê o erro cru do driver e o embrulha em `TransientInfrastructureError`; HTTP, consumidor e workers só veem o erro já embrulhado e não contam de novo. Um retry do consumidor é outra execução, outro conflito real. |
 | `http_requests_total` e `http_request_duration_seconds{method,route,status}` | middleware da linha de requisição | Do mesmo ponto do log, então contam 409, 422 e 4xx em geral, que o filtro de erros não loga. Requisição abortada (`close` sem `finish`) entra **uma vez**, com `status="499"`. |
@@ -631,3 +710,108 @@ Teste (`metrics-http.test.ts`): outra conexão segura `LOCK TABLE outbox IN ACCE
 **Limitação.** O registro é em memória: um restart zera os contadores (o Prometheus trata como reset). Sem push nem agregação entre instâncias.
 
 Testes: `prometheus.test.ts` e `metrics-audit.test.ts` (unidade), `lock-conflict-metric.test.ts` (classificação 55P03/40P01) e `metrics-http.test.ts` (Nest, Express e Postgres reais: exposição estrita, contagens exatas, 409/422/404/400, histograma fechando com a contagem, labels limitados, abortada contada uma vez, 55P03 real com `lock_timeout` curto, transição pelo worker de pendentes, lag no scrape e banco fora do ar).
+
+## 12. Mapeamento HTTP consolidado
+
+O mesmo mapeamento vale em todos os endpoints (filtro único `HttpErrorFilter`). Corpo de erro: `{code, message}`, mais `details` no 400 de validação. Corpo de transação (submissão, replay e consulta): `{transactionId, status, failureCode, balance, idempotentReplay}` (5.9).
+
+| Status | `code` / situação | Persiste algo? | Na fila (7.3) |
+|---|---|---|---|
+| 200 | transação `PROCESSED` (primeira vez ou replay); consultas de transação em qualquer estado (9.3); wallet, ledger e reconciliação (mesmo com `consistent: false`) | sim, na submissão | ack |
+| 201 | wallet criada | sim | — |
+| 202 | reversão aceita em `PENDING_REFERENCE` (`balance: null`) | sim | ack |
+| 400 | `INVALID_PAYLOAD` (corpo, header `Idempotency-Key`, id da rota, `OPENING`, provider `internal`, JSON malformado), `INVALID_CURSOR`, `INVALID_LIMIT` | não | DLQ (permanente) |
+| 404 | `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND`; `NOT_FOUND` para rota inexistente | não (2.7) | DLQ (permanente) |
+| 405 / 413 / 415 | `METHOD_NOT_ALLOWED`, `PAYLOAD_TOO_LARGE`, `UNSUPPORTED_MEDIA_TYPE` (do Express/Nest, com o mesmo formato) | não | — |
+| 409 | `IDEMPOTENCY_KEY_CONFLICT` (mesma key, payload diferente), `EXTERNAL_TRANSACTION_ID_CONFLICT` (mesmo id externo, outra key; 5.4), `WALLET_ALREADY_EXISTS` | não | DLQ (permanente); também `INBOX_MESSAGE_CONFLICT`, que só existe na fila |
+| 422 | rejeição de negócio: `status: REJECTED` com `failureCode` (seção 3) | sim, idempotente | ack |
+| 500 | `INTERNAL_ERROR`: bug, inclusive violação de uma constraint que não deveria acontecer (5.4) | não | retry curto e DLQ no limite |
+| 503 | `SERVICE_UNAVAILABLE` com `Retry-After: 1`: falha transitória (conexão, `55P03`, `40P01`, `40001`) | não | retry com backoff e DLQ no limite |
+
+Ordem que importa: como o lock da wallet vem antes da checagem de idempotência, uma key reaproveitada com payload para uma wallet inexistente dá 404, não 409 (5.1).
+
+## 13. Falhas eliminatórias: onde está a proteção e qual teste a prova
+
+As oito falhas eliminatórias da seção 14 do enunciado. Todos os testes citados existem e passam na suíte (`bun test`). Caminhos de teste relativos a `test/`.
+
+| Eliminatória | Proteção (arquivo) | Teste(s) que provam | Prova de mutação |
+|---|---|---|---|
+| **1. `number` para dinheiro** | `Money` sobre `decimal.js` com regex estrita (`src/domain/money.ts`, 4.1); `NUMERIC(19,2)` (migration 0001, 2.1); SQL com `::text` e parâmetro string (`sql-repositories.ts`, `sql-wallet-queries.ts`, 1.2); validador HTTP recusa `amount` numérico (`src/interface/http/validation.ts`, 5.9) | `unit/domain/purity.test.ts` "no floating point conversion on money (parseFloat, Number(), Number#toFixed)"; `unit/domain/money.test.ts` "rejects a non-string amount (JSON number)", "is exact where binary floats are not (0.10 + 0.20 = 0.30)"; `unit/interface/validation.test.ts` | não registrada. A varredura do `purity.test.ts` é a rede; ela cobre só `src/domain` |
+| **2. Saldo negativo por race** | `SELECT ... FOR UPDATE` da wallet antes de qualquer INSERT (`submit-wager-transaction.ts`, `sql-repositories.ts` `lockById`, 5.1); `UPDATE ... WHERE version = ?`; `CHECK (balance >= 0)` em `wallets` e no ledger (2.3, 2.5) | `integration/wallet-lock-order.test.ts` "mandatory scenario: two bets of 80.00 over 100.00 at once..." e "50 distinct bets at once..."; `integration/multi-instance.test.ts` "two bets of 80 over 100, each to a different instance, on 20 wallets..."; `integration/schema-constraints.test.ts` "rejects a negative balance, on insert and on update" e "rejects a debit that would leave a negative balance" | sim (5.1): com um `FOR KEY SHARE` injetado antes do `FOR UPDATE` (ordem invertida), o teste das 50 apostas falha; o teste de controle reproduz o `40P01` com a ordem errada |
+| **3. Débito ou crédito duplicado** | `UNIQUE (idempotency_key)` e `UNIQUE (provider_id, external_transaction_id)` (2.4); `UNIQUE (wallet_id, transaction_id)` e `UNIQUE (wallet_id, wallet_version)` no ledger (2.5); PK da inbox (2.6, 7.2); `wt_single_reversal_uq` contra dupla reversão (2.4) | `integration/wallet-lock-order.test.ts` "the same bet 50 times at once: one debit, 49 replays..."; `integration/multi-instance.test.ts` "the same bet 50 times spread across the 3 instances..."; `integration/sqs-consumer-crash.test.ts` "the redelivered message is a duplicate: one debit, one inbox row"; `integration/sqs-consumer-concurrency.test.ts` (as duas); `integration/reversal-concurrency.test.ts` "double reversal of the same BET in parallel"; `integration/schema-constraints.test.ts` "idempotency key is unique", "at most one entry per (wallet, transaction)", "a reference is reversed once in total..." | não registrada |
+| **4. Idempotência só em memória** | a decisão é do `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING` e do `payload_hash` gravado (5.2, 5.3); a inbox é tabela (7.2). Nenhum cache em memória | os testes de processos separados, que não compartilham memória: `integration/multi-instance.test.ts` (50 réplicas em 3 instâncias; "full restart..." com redeliveries depois do reinício); `integration/sqs-consumer-concurrency.test.ts` "3 consumer processes..."; `integration/wager-submission-http.test.ts` "same key with a different payload is a 409 IDEMPOTENCY_KEY_CONFLICT, and nothing is written" | não registrada |
+| **5. Correta só com uma instância** | sem lock global nem estado em memória: lock por linha (0.2), `SKIP LOCKED` na outbox (6.2), listagem sem lock + releitura sob o lock no worker (8.1) | `integration/multi-instance.test.ts` (6 cenários com 3 processos reais, incluindo crash e reinício); `integration/sqs-consumer-concurrency.test.ts` (3 processos); `integration/outbox-concurrency.test.ts` "three publishers (separate pools) drain ~200 events..."; `integration/pending-reference-worker.test.ts` (dois workers em apps separados) | não registrada |
+| **6. Evento publicado antes do commit** | evento gravado na outbox **dentro** da transação financeira (`submit-wager-transaction.ts`, `resolve-pending-reference.ts`); o publisher só enxerga linhas commitadas e marca `published_at` na própria transação, depois do envio (6.2, 6.3) | `integration/wager-submission-http.test.ts` "BET writes WagerTransactionProcessed and WalletBalanceChanged; LOSS and REJECTED write only their own event" e os casos que "write nothing" (404, 409); `integration/wallet-lock-order.test.ts` "a lock held past lock_timeout is a 503 with Retry-After, writes nothing..."; `integration/inbox-submission.test.ts`; `integration/outbox-publisher.test.ts` "commit failure after the send" (duas variantes); `integration/outbox-concurrency.test.ts` "a process killed after SQS accepted the batch leaves the rows pending..." | parcial (6.3): mover o contador `outbox_published_total` para antes do commit quebra a variante do `COMMIT`. Prova o momento das métricas, não da publicação; não há mutação registrada que publique antes do commit da transação financeira |
+| **7. Ausência de ledger auditável** | `wallet_ledger_entries` com aritmética checada (`ledger_arithmetic`), FKs de moeda e de wallet e triggers que bloqueiam `UPDATE`, `DELETE` e `TRUNCATE` (2.5); `Wallet.apply` sempre devolve o lançamento (4.2); reconciliação (9.4) | `integration/schema-constraints.test.ts` "UPDATE is blocked by the trigger", "DELETE is blocked by the trigger", "TRUNCATE is blocked by the trigger", "rejects entries whose arithmetic does not balance"; `integration/reconciliation-http.test.ts`; o fechamento `balance == ledger` de todo teste com wallets (14) | sim: com a reconciliação em duas leituras separadas, o teste de reconciliação em paralelo falha em 3 de 3 rodadas (9.4) |
+| **8. Testes que trocam PostgreSQL e SQS por mocks** | `test/integration/support/database.ts` usa o Postgres real (`TEST_DATABASE_URL`); filas reais no LocalStack, temporárias por teste | todos os 25 arquivos de `test/integration` usam os containers reais. Conferido por busca: nenhum `mock(`, `mock.module`, `spyOn` ou `jest.fn` em `test/integration`. Os dublês que existem (relógio manual, decorators que delegam ao cliente real para injetar falha) envolvem a infraestrutura real, não a substituem | não se aplica |
+
+## 14. Testes exigidos pelo enunciado (seção 13) e onde estão
+
+Caminhos relativos a `test/`. "Lacuna" marca o que não está coberto como pedido.
+
+**Unidade**
+| Item exigido | Teste |
+|---|---|
+| Operações e validações de `Money` (escala, arredondamento, entradas inválidas) | `unit/domain/money.test.ts`: escala fixa de 2 casas, 15 formatos inválidos, aritmética exata, comparação. **Interpretação:** não há arredondamento, porque não há operação que gere mais de 2 casas (só soma e subtração) e uma entrada com 3 casas é recusada, não arredondada |
+| Invariantes da `Wallet` | `unit/domain/wallet.test.ts` (versão, débito acima do saldo, valor zero ou negativo, moeda, saldo igual à soma dos lançamentos) |
+| Regras de BET, WIN, LOSS, REFUND, ROLLBACK | `unit/domain/wager-transaction.test.ts` (criação por tipo, direção do ledger, `validateReference`, código de overdraw) |
+| Conflito de moeda | `unit/domain/money.test.ts` "Money currency conflicts"; `unit/domain/wallet.test.ts` "rejects an operation in another currency..."; integração: `CURRENCY_MISMATCH` em `integration/wager-submission-http.test.ts` |
+| Idempotency key com payload divergente | `unit/domain/wager-transaction.test.ts` "same hash matches, a different hash is a conflict"; `unit/application/payload-hash.test.ts`; integração: o 409 em `integration/wager-submission-http.test.ts` |
+
+**Integração** (PostgreSQL e LocalStack reais)
+| Item exigido | Teste |
+|---|---|
+| Migrations e constraints | `integration/schema-constraints.test.ts` (tenta violar cada constraint e o trigger; `down` até zero e `up`); `integration/outbox-indexes.test.ts` (`down`/`up` da 0004) |
+| Atomicidade entre wallet, ledger, inbox e outbox | `integration/wager-submission-http.test.ts` "outbox in the same transaction"; `integration/inbox-submission.test.ts` (erro depois da inbox desfaz tudo) |
+| Inbox e redelivery | `integration/sqs-consumer.test.ts` (a mesma mensagem 10 vezes, `messageId` novo, HTTP depois SQS); `integration/inbox-submission.test.ts` |
+| Publishers concorrentes sobre a mesma outbox | `integration/outbox-concurrency.test.ts` "three publishers (separate pools)..." |
+| Retry e DLQ | `integration/sqs-consumer.test.ts` (55P03 reprocessado, venenosas para a DLQ com motivo, limite de tentativas); `integration/outbox-publisher.test.ts` (SQS fora do ar, timeout, publicação parcial) |
+| Recuperação após reinicialização | `integration/outbox-publisher.test.ts` "recovery after restart..."; `integration/pending-reference-worker.test.ts` (reinício); `integration/multi-instance.test.ts` "full restart..."; `integration/pool-recovery.test.ts` |
+
+**Concorrência** (paralelismo real)
+| Item exigido | Teste |
+|---|---|
+| 1. Mesma aposta 50 vezes em paralelo → um débito | `integration/wallet-lock-order.test.ts` "the same bet 50 times at once..."; `integration/multi-instance.test.ts` (espalhada em 3 instâncias) |
+| 2. Disputa do saldo da mesma wallet (cenário da seção 8) | `integration/wallet-lock-order.test.ts` "mandatory scenario: two bets of 80.00 over 100.00 at once..."; `integration/multi-instance.test.ts` (20 wallets, instâncias diferentes) |
+| 3. Wallets distintas em paralelo | `integration/multi-instance.test.ts` "distinct wallets in parallel on the 3 instances, over HTTP and the queue..." |
+| 4. ≥ 3 processos/instâncias | `integration/multi-instance.test.ts` (3 processos da API); `integration/sqs-consumer-concurrency.test.ts` e `integration/outbox-concurrency.test.ts` (3 processos via `Bun.spawn`) |
+| 5. Worker morto depois do commit e antes do ack | `integration/sqs-consumer-crash.test.ts`; `integration/multi-instance.test.ts` "crash: ..." |
+| 6. Dois publishers sobre a mesma outbox | `integration/outbox-concurrency.test.ts` (três publishers) |
+| 7. ROLLBACK ou REFUND antes da referência | `integration/reversals-http.test.ts`; `integration/sqs-consumer.test.ts` (REFUND antes da BET); `integration/multi-instance.test.ts` "REFUND sent to one instance before its BET reaches another..."; `integration/pending-reference-worker.test.ts` |
+| 8. Reinício com consistência final | `integration/multi-instance.test.ts` "full restart: all 3 killed mid-load..." |
+
+**Invariante `wallet.balance == saldo reconstruído pelo ledger`.** Verificada por `walletsDivergingFromLedger` (`integration/support/database.ts`) em 22 dos 25 arquivos de integração. **Lacunas:** `auth-guard-coverage.test.ts`, `health-http.test.ts` e `outbox-sqs-dedup.test.ts` não a verificam; nenhum deles cria wallet nem movimenta saldo (cobertura de guard, health check e deduplicação do LocalStack).
+
+**Outras lacunas, sem esconder:**
+- SIGTERM real entre processos não é testado (no Windows o `kill` é forçado); o shutdown gracioso é testado por `app.close()`, que percorre os mesmos hooks (6.5, 7.7, 10.2).
+- O reenvio da outbox **fora** da janela de 5 min de deduplicação do FIFO não é testado (exigiria esperar 5 min); é contrato documentado para quem consome os eventos (6.3).
+- A eliminatória 1 é varrida só em `src/domain` (`purity.test.ts`); fora do domínio a proteção é a revisão e o SQL com `::text`.
+
+## 15. Limitações conhecidas
+
+Consolidadas; o detalhe está na seção indicada.
+
+**Funcionais**
+- `FAILED` / `INTERNAL_ERROR` é modelado mas nenhum caminho o produz; falha de infraestrutura desfaz tudo (3).
+- Reversão pendente só é resolvida no próximo ciclo do worker, até um degrau de backoff (até 5 min) depois da chegada da referência (5.10, melhoria em 8.7).
+- Depois da rejeição por prazo, a reversão está encerrada; o provedor precisa de novo `externalTransactionId` e nova key (8.3).
+- REFUND de uma BET que já teve WIN é permitido; uma referência só pode ser revertida uma vez no total (2.4, 5.10).
+- Autenticação não implementada: `AuthGuard` no-op, desenho de produção em 11.1. Sem ela, qualquer cliente pode disparar a reconciliação (9.4).
+
+**Operacionais**
+- Outbox e inbox crescem sem limpeza (6.7).
+- Evento envenenado da outbox fica em retry para sempre e exige ação humana (6.4); linha venenosa do worker de pendentes ocupa vaga do lote e nunca expira (8.4).
+- Uma mensagem seguidora pode chegar à vez dela com `receiveCount` alto e ir à DLQ numa única falha transitória (7.4).
+- O abort do long poll no shutdown pode atrasar mensagens em até a visibilidade (7.7).
+- Relógios diferentes entre instâncias deslocam o cronograma de retry e o `outbox_lag_seconds`, nunca a correção (6.2).
+- Migration 0004 cria índices sem `CONCURRENTLY`: só aceitável com o serviço parado (6.8).
+- Reconciliação soma o ledger inteiro: `O(n)` por chamada (9.4).
+- O throughput de uma wallet muito disputada é limitado pela duração da transação (0.2).
+
+**Observabilidade**
+- Métricas em memória por instância, zeradas no restart; a profundidade da DLQ não é exposta (11.4).
+- O `JsonLogger` não sanitiza mensagens em string de terceiros; um erro de bootstrap com valor na mensagem não é coberto (11.2).
+- A varredura de `src/` dos logs é por texto, não AST: não vê erro repassado por variável intermediária (11.2, 10.2).
+- A varredura de logs do `multi-instance` ignora linhas `info`; a premissa (erros só por `errorFields` em `warn`/`error`) é imposta por teste (10.2).
+
+**Testes:** ver as lacunas listadas em 14.
