@@ -75,6 +75,16 @@ class NetworkError extends Error {
   override readonly name = 'NetworkError';
 }
 
+/** Nome, code do socket e mensagem do erro do fetch (e da causa), para um erro de rede ser diagnosticável. */
+function describeFetchFailure(error: unknown): string {
+  const parts = (e: unknown): string => {
+    const o = e as { name?: unknown; code?: unknown; message?: unknown } | null;
+    return `${String(o?.name ?? typeof e)} code=${String(o?.code ?? '-')} message=${String(o?.message ?? '-')}`;
+  };
+  const cause = (error as { cause?: unknown } | null)?.cause;
+  return cause === undefined ? parts(error) : `${parts(error)} <- cause: ${parts(cause)}`;
+}
+
 beforeAll(async () => {
   orm = await createTestOrm();
   sql = sqlRunner(orm);
@@ -130,12 +140,15 @@ async function call(instance: Instance, method: string, path: string, body?: unk
         headers: { 'content-type': 'application/json', ...headers },
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: AbortSignal.timeout(30_000),
+        // Sem reaproveitar conexão: uma keep-alive que o servidor já fechou dá ECONNRESET na primeira requisição
+        // depois de um tempo ocioso, e um POST sem chave de idempotência não pode ser reenviado às cegas.
+        keepalive: false,
       });
       status = response.status;
       instanceId = response.headers.get('x-instance-id');
       text = await response.text();
     } catch (error) {
-      throw new NetworkError(`${instance.id}: ${error instanceof Error ? error.name : 'unknown'}`);
+      throw new NetworkError(`${instance.id} ${method} ${path}: ${describeFetchFailure(error)}`, { cause: error });
     }
     const result: ApiResult = { target: instance.id, instanceId, status, body: text === '' ? {} : JSON.parse(text) };
     responses.push(result);
