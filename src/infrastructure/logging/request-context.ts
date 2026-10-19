@@ -46,3 +46,13 @@ export function contextFields(): LogFields {
   const context = storage.getStore();
   return context === undefined ? {} : { ...context };
 }
+
+/** Um `correlationId` novo para um ciclo de worker (lote da outbox, ciclo de pendentes), sem consumir o `IdGenerator`. */
+export function newCorrelationId(): string {
+  return crypto.randomUUID();
+}
+
+/** Roda `work` no contexto atual, ou abre um novo (com `correlationId` próprio) se não houver nenhum. */
+export function runInContext<T>(work: () => T): T {
+  return storage.getStore() === undefined ? storage.run({ correlationId: newCorrelationId() }, work) : work();
+}

@@ -203,6 +203,9 @@ describe('a cycle of the worker', () => {
     expect(await entriesOf(w.id)).toBe(1);
     // O log do worker chegou ao logger capturado (então a checagem de valores do afterEach o cobre).
     expect(logs.entries.some((e) => e.message.includes('Pending reference expired'))).toBe(true);
+    // Cada ciclo do worker abre um contexto de log com correlationId próprio (ARCHITECTURE 11.3).
+    const expiredLog = logs.entries.find((e) => e.message.includes('Pending reference expired'));
+    expect(JSON.parse(expiredLog!.message).correlationId).toMatch(/^[0-9a-f-]{36}$/);
 
     const events = await publishAndReceive(1);
     const rejected = events.find((e) => e.eventType === 'WagerTransactionRejected'

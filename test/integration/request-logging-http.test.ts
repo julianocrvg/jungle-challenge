@@ -227,3 +227,50 @@ describe('consumidor SQS', () => {
     Logger.overrideLogger(api.logger);
   }, 40_000);
 });
+
+describe('correlationId e idempotência', () => {
+  test('o correlationId não entra no payloadHash: a mesma submissão com outro X-Correlation-Id é replay, não 409', async () => {
+    const wallet = await createWalletViaApi(api, '100.00');
+    const payload = BRL_BET(wallet);
+    const headers = { 'idempotency-key': `provider-a:${payload.externalTransactionId}` };
+    const first = await api.post('/wagering/transactions', payload, { ...headers, 'x-correlation-id': 'corr-first' });
+    const second = await api.post('/wagering/transactions', payload, { ...headers, 'x-correlation-id': 'corr-second' });
+    const third = await api.post('/wagering/transactions', payload, headers); // gerado
+
+    expect([first.status, second.status, third.status]).toEqual([200, 200, 200]);
+    expect(first.body.idempotentReplay).toBe(false);
+    expect(second.body.idempotentReplay).toBe(true);
+    expect(third.body.idempotentReplay).toBe(true);
+    expect(second.body.transactionId).toBe(first.body.transactionId);
+    expect(second.headers.get('x-correlation-id')).toBe('corr-second');
+    const [debits] = await sql(`SELECT count(*)::int AS n FROM wallet_ledger_entries WHERE wallet_id = ? AND direction = 'DEBIT'`, [wallet.id]);
+    expect(debits?.n).toBe(1);
+  });
+});
+
+describe('workers', () => {
+  test('o publisher da outbox abre um contexto de log por lote, com correlationId próprio', async () => {
+    const capture = new CapturingLogger();
+    const worker = await startTestApp({
+      logger: capture,
+      outbox: { enabled: true, pollIntervalMs: 50 },
+      // Fila que não existe: o lote falha e o publisher loga (sem perder o evento).
+      sqs: { eventsQueueUrl: `${SQS.endpoint}/000000000000/does-not-exist-${Bun.randomUUIDv7()}.fifo` },
+    });
+    try {
+      await createWalletViaApi(worker, '100.00'); // gera um evento WalletBalanceChanged na outbox
+      const lines = (): Record<string, unknown>[] => capture.entries
+        .filter((e) => e.message.startsWith('{')) // o Nest também loga texto puro ao subir
+        .map((e) => JSON.parse(e.message) as Record<string, unknown>)
+        .filter((f) => typeof f.message === 'string' && f.message.startsWith('Outbox batch publish failed'));
+      await waitFor(async () => lines().length, (n) => n >= 2, 20_000);
+      const ids = lines().map((f) => f.correlationId);
+      expect(ids.every((id) => typeof id === 'string' && /^[0-9a-f-]{36}$/.test(id))).toBe(true);
+      expect(new Set(ids).size).toBe(ids.length); // um correlationId por lote
+      expect(monetaryLeaks(capture.entries)).toEqual([]);
+    } finally {
+      await worker.close();
+      Logger.overrideLogger(api.logger);
+    }
+  }, 40_000);
+});

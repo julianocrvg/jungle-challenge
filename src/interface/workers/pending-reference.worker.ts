@@ -5,6 +5,7 @@ import type { PendingReferenceQueries } from '../../application/wagering/pending
 import type { ResolvePendingReference } from '../../application/wagering/resolve-pending-reference';
 import { sqlStateOf } from '../../infrastructure/persistence/database-errors';
 import { errorFields } from '../../infrastructure/logging/describe-error';
+import { runInContext } from '../../infrastructure/logging/request-context';
 
 export interface PendingReferenceWorkerOptions {
   /** Se falso, o laço não sobe com a aplicação (os testes chamam `runOnce` direto). */
@@ -68,7 +69,12 @@ export class PendingReferenceWorker {
    * Um ciclo. Durante o shutdown, nenhuma linha nova é iniciada: as que já começaram terminam, e as que
    * ficaram na lista continuam vencidas no banco para o próximo worker.
    */
-  async runOnce(): Promise<CycleResult> {
+  runOnce(): Promise<CycleResult> {
+    // Um contexto de log por ciclo (reaproveita o do laço, se houver).
+    return runInContext(() => this.cycle());
+  }
+
+  private async cycle(): Promise<CycleResult> {
     const ids = await this.queries.listDue(this.options.batchSize);
     let next = 0;
     let failed = 0;
@@ -85,17 +91,21 @@ export class PendingReferenceWorker {
 
   private async loop(): Promise<void> {
     while (!this.stopping) {
-      let again = false;
-      try {
-        const result = await this.runOnce();
+      // Um contexto de log por ciclo, com correlationId próprio (ARCHITECTURE 11.3). Os ids de cada linha vão
+      // explícitos nos logs: as resoluções de um ciclo rodam em paralelo e dividiriam um contexto mutável.
+      const again = await runInContext(async () => {
+        try {
+          const result = await this.runOnce();
         // Só roda de novo na hora se o lote veio cheio E nada falhou. Uma linha que falha sempre (venenosa)
         // continua vencida e volta na próxima listagem; sem esta regra, ela viraria um laço quente.
-        again = result.listed >= this.options.batchSize && result.failed === 0;
-      } catch (error) {
+          return result.listed >= this.options.batchSize && result.failed === 0;
+        } catch (error) {
         // A listagem falhou (banco fora do ar): nada foi alterado. Espera e tenta de novo.
-        this.metrics.increment('pending_reference_cycle_errors_total');
-        this.logger.error('Pending reference cycle failed', errorFields(error));
-      }
+          this.metrics.increment('pending_reference_cycle_errors_total');
+          this.logger.error('Pending reference cycle failed', errorFields(error));
+          return false;
+        }
+      });
       if (!again && !this.stopping) await this.idle();
     }
   }

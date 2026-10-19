@@ -2,6 +2,7 @@ import type { PublishOutboxBatch } from '../../application/outbox/publish-outbox
 import type { Metrics } from '../../application/ports/metrics';
 import type { StructuredLogger } from '../../application/ports/structured-logger';
 import { errorFields } from '../../infrastructure/logging/describe-error';
+import { runInContext } from '../../infrastructure/logging/request-context';
 
 export interface OutboxPublisherWorkerOptions {
   /** Se falso, o laço não sobe com a aplicação (instâncias só de API, ou testes que chamam o lote direto). */
@@ -56,15 +57,18 @@ export class OutboxPublisherWorker {
 
   private async loop(): Promise<void> {
     while (!this.stopping) {
-      let fullBatch = false;
-      try {
-        const result = await this.publishBatch.execute();
-        fullBatch = result.claimed >= this.options.batchSize;
-      } catch (error) {
-        // Banco fora do ar ou bug: o lote foi desfeito e as linhas seguem pendentes. Espera e tenta de novo.
-        this.metrics.increment('outbox_tick_errors_total');
-        this.logger.error('Outbox publisher tick failed', errorFields(error));
-      }
+      // Um contexto de log por lote, com correlationId próprio (ARCHITECTURE 11.3).
+      const fullBatch = await runInContext(async () => {
+        try {
+          const result = await this.publishBatch.execute();
+          return result.claimed >= this.options.batchSize;
+        } catch (error) {
+          // Banco fora do ar ou bug: o lote foi desfeito e as linhas seguem pendentes. Espera e tenta de novo.
+          this.metrics.increment('outbox_tick_errors_total');
+          this.logger.error('Outbox publisher tick failed', errorFields(error));
+          return false;
+        }
+      });
       if (!fullBatch && !this.stopping) await this.idle();
     }
   }
